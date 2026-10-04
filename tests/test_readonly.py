@@ -144,7 +144,7 @@ class SourceStructure(unittest.TestCase):
             for forbidden in ("urllib.request", "http.client", "import requests", "import httpx", "import socket"):
                 self.assertNotIn(forbidden, text, "%s uses %s" % (path.name, forbidden))
 
-    def test_http_request_has_exactly_two_callers_in_wave_module(self):
+    def test_http_request_has_exactly_three_callers_in_wave_module(self):
         tree = ast.parse((PACKAGE / "wave.py").read_text(encoding="utf-8"))
         callers = set()
 
@@ -163,8 +163,10 @@ class SourceStructure(unittest.TestCase):
                 self.generic_visit(node)
 
         Visitor().visit(tree)
-        # _post_token talks to the sign-in server (OAuth); _exchange is the only way to the Wave API.
-        self.assertEqual(callers, {"_post_token", "_exchange"})
+        # _post_token talks to the sign-in server (OAuth); _exchange is the only way to the Wave API;
+        # check_reachable is an unauthenticated "does this host answer at all?" probe for the installer
+        # (no token, no Wave path - it cannot reach a Wave endpoint).
+        self.assertEqual(callers, {"_post_token", "_exchange", "check_reachable"})
 
     def test_every_route_to_the_api_runs_the_guard_first(self):
         for func in (WaveApi.call, WaveApi.raw):

@@ -5,7 +5,7 @@ import re
 import unittest
 from pathlib import Path
 
-from bwwatch import cli
+from bwwatch import cli, probe
 from bwwatch.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +86,7 @@ class EnvTemplate(unittest.TestCase):
 
 class Readme(unittest.TestCase):
     def test_every_command_is_documented(self):
-        for command in cli.COMMANDS:
+        for command in cli.ALL_COMMANDS:
             if command == "run":
                 continue
             self.assertIn("`%s" % command, README, "README does not mention the %r command" % command)
@@ -105,7 +105,7 @@ class Readme(unittest.TestCase):
         self.assertEqual(AUTH_RETRY_SECONDS, 6 * 3600)
         self.assertIn("every 6 hours", README)
         self.assertEqual(BACKOFF_AFTER_FAILURES, 3)
-        self.assertEqual(len(cli.PROBE_NAMES) + 2, 14)
+        self.assertEqual(len(probe.PROBE_NAMES) + 2, 14)
         self.assertIn("about 14", README)
 
 
@@ -159,7 +159,8 @@ class Dockerfile(unittest.TestCase):
         self.assertRegex(self.TEXT, r"(?m)^FROM python:3\.\d+-slim-\w+$")
         self.assertNotIn(":latest", self.TEXT)
         copies = re.findall(r"(?m)^COPY (.*)$", self.TEXT)
-        self.assertEqual(copies, ["bwwatch/ /app/bwwatch/"], "only the package is copied: no .env, tests or data")
+        self.assertEqual(copies, ["bwwatch/ /app/bwwatch/", ".env.example /app/.env.example"],
+                         "only the package and the settings template are copied: no .env, tests or data")
 
     def test_runs_as_an_unprivileged_user_after_start(self):
         self.assertIn("--uid 10001", self.TEXT)

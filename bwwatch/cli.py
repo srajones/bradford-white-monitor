@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import logging
+import logging.handlers
 import os
 import re
 import secrets
@@ -14,19 +15,22 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from . import __version__
 from .config import Config, ConfigError, RequestSpec
-from .cycle import TAGS, describe_event, fetch
+from .cycle import describe_event, fetch
 from .db import DB_NAME, DatabaseTooNew, backup_now, connect, init_schema, integrity_check, list_backups, table_counts
 from .errors import AuthError, WaveError
 from .faults import extract_events
-from .notify import Message, Notifier
+from .notify import Notifier, test_message
 from .privs import AlreadyRunning, prepare_runtime
+from .probe import REQUEST_COUNT, run_probe
 from .readings import extract_reading, reading_from_row
 from .service import Service, healthcheck
 from .util import iso, local_time, truncate
+from .verify import format_checks, overall_ok, run_checks
 from .wave import TokenManager, TokenStore, WaveApi, parse_redirect
 
 log = logging.getLogger("bwwatch")
@@ -56,17 +60,8 @@ It sends about {count} read-only GET requests to {host}, 3 seconds apart, once. 
 a guessed endpoint name starting with 'get' and nothing else; it changes nothing (bwwatch
 cannot send anything else). It is optional: the README describes other ways to find the request.
 
-Run it only if you are comfortable with that:   bwwatch probe --yes
+Run it only if you are comfortable with that:   ./bwctl probe --yes
 """
-
-# Guessed names for the notification / fault-history read. Every one is a plain 'get...' read.
-PROBE_NAMES = (
-    "getNotifications", "getNotificationList", "getNotificationHistory", "getApplianceNotifications",
-    "getFaults", "getFaultHistory", "getFaultList", "getApplianceFaults",
-    "getAlerts", "getAlarms", "getEvents", "getApplianceHistory",
-)
-PROBE_CONTROL = "getZzzNoSuchEndpoint"
-PROBE_PAUSE_SECONDS = 3.0  # between guesses: gentle on the server
 
 
 # --- helpers ----------------------------------------------------------------
@@ -78,6 +73,19 @@ def setup_logging(level: str) -> None:
         datefmt="%Y-%m-%dT%H:%M:%SZ",
         stream=sys.stderr,
     )
+
+
+def add_file_logging(path: Path) -> None:
+    """Also keep a small rotating log (about 5 MB at most) in the data folder, so a failure is still
+    explainable days later and everything bwwatch writes stays inside its own folder."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(str(path), maxBytes=1_000_000, backupCount=4, encoding="utf-8")
+    except OSError as exc:
+        log.warning("cannot write the log file %s: %s", path, exc)
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%dT%H:%M:%SZ"))
+    logging.getLogger().addHandler(handler)
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
@@ -263,47 +271,14 @@ def cmd_call(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-def _signature(resp: Any) -> tuple:
-    return resp.status, " ".join(resp.text().split())[:80]
-
-
 def cmd_probe(cfg: Config, args: argparse.Namespace) -> int:
     host = cfg.api_base.split("://", 1)[-1]
     if not args.yes:
-        print(PROBE_NOTICE.format(count=len(PROBE_NAMES) + 2, host=host))
+        print(PROBE_NOTICE.format(count=REQUEST_COUNT, host=host))
         return 2
     _store, _tokens, api = _make_api(cfg)
-    stop = threading.Event()
     try:
-        items = api.list_appliances()
-        if not items:
-            print("error: the account has no appliances")
-            return 1
-        ctx = {"mac": str(items[0].get("macAddress") or ""), "serial": "", "name": ""}
-
-        def ask(name: str) -> Any:
-            spec = RequestSpec.parse("GET /wave/%s?username={account_id}&macAddress={mac}" % name, label="probe")
-            return api.raw(spec, ctx)
-
-        control = ask(PROBE_CONTROL)
-        baseline = _signature(control)
-        print("An endpoint that does not exist answers:  HTTP %d  %s" % baseline)
-        found = []
-        for name in PROBE_NAMES:
-            if stop.wait(PROBE_PAUSE_SECONDS):
-                break
-            resp = ask(name)
-            if resp.status == 429:
-                print("The server asked us to slow down (HTTP 429). Stopping.")
-                return 1
-            if _signature(resp) == baseline:
-                print("  %-28s no such endpoint" % name)
-                continue
-            found.append(name)
-            print("  %-28s HTTP %d  <-- different from an unknown endpoint" % (name, resp.status))
-            snippet = " ".join(resp.text().split())[:160]
-            if snippet:
-                print("      %s" % snippet)
+        found = run_probe(api, print)
     except WaveError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
@@ -311,7 +286,7 @@ def cmd_probe(cfg: Config, args: argparse.Namespace) -> int:
         print("\nNone of the guesses exist. See README 'Finding the fault request' for the other ways.")
         return 1
     print("\nCandidates. Try one and read the answer, for example:")
-    print("  docker compose run --rm bwwatch call \"GET /wave/%s?username={account_id}&macAddress={mac}\"" % found[0])
+    print("  ./bwctl call \"GET /wave/%s?username={account_id}&macAddress={mac}\"" % found[0])
     print("If the answer is your notification / fault list, put that line in .env as:")
     print("  BW_FAULT_REQUEST=GET /wave/%s?username={account_id}&macAddress={mac}" % found[0])
     return 0
@@ -472,31 +447,45 @@ def cmd_test_notify(cfg: Config, args: argparse.Namespace) -> int:
         print("No notification channel is configured. Set NTFY_TOPIC (or Telegram / email / webhook / HA_WEBHOOK_URL) in .env.")
         return 1
     kind = args.event
-    data: Optional[Dict[str, Any]] = None
-    if kind == "fault":
-        title = "TEST - Water heater fault 99"
-        data = {
-            "appliance": {"name": "Test heater", "mac": "00:00:00:00:00:00", "serial": "TEST"},
-            "fault": {"id": 0, "code": "99", "description": "This is only a test, not a real fault",
-                      "occurred_at": iso(), "detected_at": iso(), "kind": "event", "source": "test"},
-        }
-    else:
-        title = "bwwatch test (%s)" % kind
-    message = Message(
-        title,
-        "If you can read this, alerts from bwwatch reach you. Sent %s." % local_time(iso(), cfg.display_tz),
-        cfg.fault_priority if kind == "fault" else 3,
-        TAGS.get(kind, ()),
-        kind=kind,
-        data=data,
-    )
-    results = notifier.send(message)
+    results = notifier.send(test_message(kind, local_time(iso(), cfg.display_tz), cfg.fault_priority))
     if not results:
         print("No channel is set to receive '%s' alerts (see the *_EVENTS settings)." % kind)
         return 1
     for name, error in results.items():
         print("  %-14s %s" % (name, "sent" if error is None else "FAILED: " + error))
     return 0 if all(error is None for error in results.values()) else 1
+
+
+def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
+    """Is the installation actually working? (Used by the installer; safe to run any time.)"""
+    def progress(text: str) -> None:
+        print("  ... " + text, file=sys.stderr, flush=True)
+
+    checks = run_checks(cfg, wait=args.wait, since=args.since, progress=progress if args.wait else None)
+    print(format_checks(checks))
+    return 0 if overall_ok(checks) else 1
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """The guided setup wizard (and the small helper actions install.sh uses around it)."""
+    from . import wizard  # only this command needs it
+
+    data_dir = Path(os.environ.get("DATA_DIR") or "/data")
+    prepare_runtime(data_dir)
+    if args.print_env:
+        return wizard.print_generated(data_dir)
+    if args.cleanup:
+        wizard.cleanup(data_dir)
+        return 0
+    if args.verify:
+        return wizard.verify_installed(data_dir, os.environ, print)
+    template_path = Path(__file__).resolve().parent.parent / ".env.example"
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except OSError:
+        print("error: the settings template (.env.example) is missing from the image", file=sys.stderr)
+        return 1
+    return wizard.Wizard(wizard.Console(), os.environ, data_dir, template).run()
 
 
 def cmd_healthcheck(cfg: Config, args: argparse.Namespace) -> int:
@@ -518,8 +507,11 @@ COMMANDS: Dict[str, Callable[[Config, argparse.Namespace], int]] = {
     "backup": cmd_backup,
     "dbcheck": cmd_dbcheck,
     "test-notify": cmd_test_notify,
+    "verify": cmd_verify,
     "healthcheck": cmd_healthcheck,
 }
+# `setup` and `version` take no loaded configuration, so they are handled before COMMANDS.
+ALL_COMMANDS = tuple(COMMANDS) + ("setup", "version")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -550,6 +542,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("test-notify", help="send a test alert to every configured channel")
     p.add_argument("--event", default="info", choices=("info", "fault", "health", "recovered", "cleared", "setting"),
                    help="kind of alert to send (use 'fault' to test a Home Assistant automation)")
+    p = sub.add_parser("verify", help="check the installation really works: polling, alerts, backups (used by the installer)")
+    p.add_argument("--wait", type=float, default=0.0, help="give a just-started service this many seconds to finish its first poll")
+    p.add_argument("--since", type=float, default=None, metavar="EPOCH",
+                   help="only count the service and polls that started after this time (seconds since 1970; the installer uses it)")
+    p = sub.add_parser("setup", help="the guided setup wizard (install.sh runs it for you)")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--print-env", action="store_true", help="print the settings file the wizard produced (used by install.sh)")
+    group.add_argument("--verify", action="store_true", help="check the installed .env reached the service exactly as chosen")
+    group.add_argument("--cleanup", action="store_true", help="remove the wizard's temporary output files")
     sub.add_parser("healthcheck", help="exit 0 if the service is alive (used by Docker)")
     sub.add_parser("version", help="print the version")
     return parser
@@ -565,8 +566,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     level = args.log_level or os.environ.get("LOG_LEVEL") or ("INFO" if command == "run" else "WARNING")
     setup_logging(level)
     try:
+        if command == "setup":  # must work even when the current settings are broken - it repairs them
+            return cmd_setup(args)
         cfg = Config.from_env(os.environ)
         prepare_runtime(cfg.data_dir)
+        if command == "run":
+            raw = os.environ.get("LOG_FILE")
+            if raw != "":
+                add_file_logging(Path(raw) if raw else cfg.data_dir / "logs" / "bwwatch.log")
         return COMMANDS[command](cfg, args)
     except ConfigError as exc:
         print("configuration error: %s" % exc, file=sys.stderr)

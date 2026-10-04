@@ -12,3 +12,9 @@ tests/
 *.db-wal
 *.db-shm
 token.json
+
+# installer scratch files and log
+install.log
+.install.out
+.env.new
+.env.bak-*

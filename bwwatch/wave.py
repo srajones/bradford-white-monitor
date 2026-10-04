@@ -133,6 +133,18 @@ def retry_after_seconds(resp: "HttpResponse", default: float = 3600.0) -> float:
     return max(60.0, min(seconds, 6 * 3600.0))
 
 
+def check_reachable(url: str, user_agent: str = "bwwatch", timeout: float = 10.0) -> Tuple[bool, str]:
+    """Can we get *any* HTTP answer from this address? DNS, connection, proxy and TLS must all work.
+
+    Used by the setup wizard; it goes through the same code (and proxy settings) as real traffic.
+    """
+    try:
+        resp = http_request("GET", url, headers={"User-Agent": user_agent}, timeout=timeout, label=shown_url(url))
+    except WaveError as exc:
+        return False, scrub(exc, 200)
+    return True, "HTTP %d" % resp.status
+
+
 # --- token storage ----------------------------------------------------------
 class TokenStore:
     """The rotating refresh token, kept in one small file that is only ever replaced atomically."""

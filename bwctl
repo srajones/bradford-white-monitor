@@ -1,0 +1,86 @@
+#!/bin/sh
+# bwctl: everyday helper for bwwatch. Run it from anywhere:  /opt/bwheater/bwctl <command>
+#
+#   status                  one-screen summary (service, last poll, heater settings, faults)
+#   faults [--all] [--raw]  the faults it has logged
+#   logs [-f]               what the service is doing (-f follows)
+#   verify                  is everything working? (the installer's check)
+#   test-notify [--event fault]   send a test alert to every channel
+#   login                   sign in to Wave again (after a "sign-in needs attention" alert)
+#   check | call | probe | export | backup | dbcheck | ...   any bwwatch command (see: bwctl help)
+#   start | stop | restart  control the service (restart also re-reads .env)
+#   update                  rebuild after a `git pull` and restart
+#   reconfigure | uninstall run the guided setup again / remove bwwatch (install.sh)
+#
+# Like install.sh it works only inside its own folder and uses nothing but Docker.
+
+set -u
+
+# find the real folder even when this file is reached through a symbolic link
+_self=$0
+while [ -h "$_self" ]; do
+  _dir=$(cd "$(dirname "$_self")" && pwd -P)
+  _link=$(readlink "$_self")
+  case $_link in
+    /*) _self=$_link ;;
+    *)  _self=$_dir/$_link ;;
+  esac
+done
+DIR=$(cd "$(dirname "$_self")" 2>/dev/null && pwd -P) || { printf 'bwctl: cannot find its own folder\n' >&2; exit 1; }
+cd "$DIR" || exit 1
+
+PROJECT=bwwatch
+CONTAINER=bwwatch
+
+dc() { docker compose -p "$PROJECT" -f "$DIR/docker-compose.yml" --project-directory "$DIR" "$@"; }
+die() { printf 'bwctl: %s\n' "$*" >&2; exit 1; }
+
+running() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ] || return 1
+  _owner=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$CONTAINER" 2>/dev/null)
+  [ "$_owner" = "$DIR" ] || [ "$_owner" = "$(cd "$DIR" && pwd)" ]
+}
+
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  printf '\nAnything else is passed to bwwatch itself:  bwctl <command> --help\n'
+}
+
+need_ready() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed or not on PATH."
+  [ -f "$DIR/.env" ] || die "bwwatch is not installed yet. Run:  $DIR/install.sh"
+}
+
+# Run a bwwatch command inside the running container, or in a one-off container when it is not running.
+in_service() {
+  # Docker's terminal mode only when both ends are a terminal, so  bwctl export faults > f.csv  stays clean
+  # and  bwctl login  can still ask questions. (Tested here, not in a $(...), where stdout is a pipe.)
+  if [ -t 0 ] && [ -t 1 ]; then _t=''; else _t='-T'; fi
+  if running; then
+    # shellcheck disable=SC2086
+    dc exec $_t bwwatch bwwatch "$@"
+  else
+    # shellcheck disable=SC2086
+    dc run --rm $_t bwwatch "$@"
+  fi
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+
+case $cmd in
+  help|-h|--help) usage ;;
+  install)        exec "$DIR/install.sh" "$@" ;;
+  reconfigure)    exec "$DIR/install.sh" --reconfigure ;;
+  uninstall)      exec "$DIR/install.sh" --uninstall ;;
+  start)          need_ready; dc up -d bwwatch ;;
+  stop)           need_ready; dc stop ;;
+  restart)        need_ready; dc up -d --force-recreate bwwatch ;;
+  logs)           need_ready; dc logs --tail 200 "$@" bwwatch ;;
+  update)
+    need_ready
+    printf 'Rebuilding the image from the files in %s ...\n' "$DIR"
+    dc build && dc up -d bwwatch && printf 'Done. Checking:\n' && dc exec -T bwwatch bwwatch verify --wait 60
+    ;;
+  *)              need_ready; in_service "$cmd" "$@" ;;
+esac

@@ -30,6 +30,32 @@ class NotifyError(Exception):
     pass
 
 
+TEST_TAGS = {"fault": ("rotating_light",), "health": ("warning",), "recovered": ("white_check_mark",),
+             "cleared": ("white_check_mark",), "info": ("information_source",), "setting": ("gear",)}
+
+
+def test_message(kind: str, when: str, fault_priority: int = 4) -> Message:
+    """A clearly labelled test alert. For ``fault`` it carries the same structured fields as a real one."""
+    data: Optional[Dict[str, Any]] = None
+    if kind == "fault":
+        title = "TEST - Water heater fault 99"
+        data = {
+            "appliance": {"name": "Test heater", "mac": "00:00:00:00:00:00", "serial": "TEST"},
+            "fault": {"id": 0, "code": "99", "description": "This is only a test, not a real fault",
+                      "occurred_at": iso(), "detected_at": iso(), "kind": "event", "source": "test"},
+        }
+    else:
+        title = "bwwatch test (%s)" % kind
+    return Message(
+        title,
+        "If you can read this, alerts from bwwatch reach you. Sent %s." % when,
+        fault_priority if kind == "fault" else 3,
+        TEST_TAGS.get(kind, ()),
+        kind=kind,
+        data=data,
+    )
+
+
 def _check(status: int, what: str, text: str) -> None:
     if not 200 <= status < 300:
         raise NotifyError("%s answered HTTP %d: %s" % (what, status, scrub(text, 150)))

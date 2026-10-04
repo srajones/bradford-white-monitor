@@ -28,3 +28,9 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+# installer scratch files and log
+install.log
+.install.out
+.env.new
+.env.bak-*

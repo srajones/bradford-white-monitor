@@ -322,7 +322,10 @@ Run inside the container: `docker compose exec bwwatch bwwatch <command>` (or `d
 | `probe --yes` | look for the notifications endpoint (optional) |
 | `test-notify [--event fault]` | send a test alert to every channel |
 | `backup` · `dbcheck` | make a verified backup now · verify the database and list backups |
+| `verify [--wait N]` | end-to-end check: service alive, polled the cloud, heater read, alerts delivered, backups made |
+| `setup` | the guided setup wizard (`install.sh` runs it for you) |
 | `healthcheck` | exit 0 if the service is alive (Docker uses this) |
+| `version` | print the version |
 
 Logs: `docker compose logs -f`. Update: `git pull && docker compose build && docker compose up -d`.
 Stop: `docker compose stop`.

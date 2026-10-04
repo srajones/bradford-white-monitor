@@ -15,6 +15,7 @@ RUN groupadd --system --gid 10001 bwwatch \
 
 WORKDIR /app
 COPY bwwatch/ /app/bwwatch/
+COPY .env.example /app/.env.example
 RUN python -m compileall -q /app/bwwatch \
  && printf '#!/bin/sh\nexec python -m bwwatch "$@"\n' > /usr/local/bin/bwwatch \
  && chmod 0755 /usr/local/bin/bwwatch

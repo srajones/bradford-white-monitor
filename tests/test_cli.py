@@ -9,7 +9,7 @@ import json
 import unittest
 from unittest import mock
 
-from bwwatch import cli
+from bwwatch import cli, probe
 from bwwatch.config import ConfigError
 from bwwatch.wave import TokenStore
 
@@ -139,7 +139,7 @@ class Probe(CliCase):
         status, out = self.run_cmd(cli.cmd_probe, cfg, yes=False)
         self.assertEqual(status, 2)
         self.assertIn("read-only GET", out)
-        self.assertIn("bwwatch probe --yes", out)
+        self.assertIn("probe --yes", out)
         self.assertEqual(self.mock.requests, [], "nothing is sent without --yes")
 
     def test_probe_finds_a_real_endpoint_with_few_requests_and_no_writes(self):
@@ -147,14 +147,14 @@ class Probe(CliCase):
         self.sign_in(cfg)
         self.mock.disabled_routes.add("getNotifications")
         self.mock.extra_routes["getFaultHistory"] = (200, {"faults": []})
-        with mock.patch.object(cli, "PROBE_PAUSE_SECONDS", 0):
+        with mock.patch.object(probe, "PROBE_PAUSE_SECONDS", 0):
             status, out = self.run_cmd(cli.cmd_probe, cfg, yes=True)
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"getFaultHistory\s+HTTP 200\s+<-- different")
         self.assertIn("BW_FAULT_REQUEST=GET /wave/getFaultHistory?username={account_id}&macAddress={mac}", out)
         self.assertRegex(out, r"getAlerts\s+no such endpoint")
         api_calls = self.mock.hits("/wave/")
-        self.assertLessEqual(len(api_calls), 1 + 1 + len(cli.PROBE_NAMES))
+        self.assertLessEqual(len(api_calls), 1 + 1 + len(probe.PROBE_NAMES))
         self.assertTrue(all(r["method"] == "GET" for r in api_calls))
         self.assertTrue(all(r["path"].rsplit("/", 1)[-1].startswith("get") for r in api_calls))
         self.assertEqual(self.mock.writes, [])
@@ -163,7 +163,7 @@ class Probe(CliCase):
         cfg = self.cfg()
         self.sign_in(cfg)
         self.mock.disabled_routes.add("getNotifications")
-        with mock.patch.object(cli, "PROBE_PAUSE_SECONDS", 0):
+        with mock.patch.object(probe, "PROBE_PAUSE_SECONDS", 0):
             status, out = self.run_cmd(cli.cmd_probe, cfg, yes=True)
         self.assertEqual(status, 1)
         self.assertIn("None of the guesses exist", out)
@@ -172,11 +172,11 @@ class Probe(CliCase):
         cfg = self.cfg()
         self.sign_in(cfg)
         self.mock.extra_routes["getNotificationList"] = (429, {"message": "slow down"})
-        with mock.patch.object(cli, "PROBE_PAUSE_SECONDS", 0):
+        with mock.patch.object(probe, "PROBE_PAUSE_SECONDS", 0):
             status, out = self.run_cmd(cli.cmd_probe, cfg, yes=True)
         self.assertEqual(status, 1)
         self.assertIn("slow down (HTTP 429)", out)
-        self.assertLess(len(self.mock.hits("/wave/")), 2 + len(cli.PROBE_NAMES))
+        self.assertLess(len(self.mock.hits("/wave/")), 2 + len(probe.PROBE_NAMES))
 
 
 class LogViews(CliCase):

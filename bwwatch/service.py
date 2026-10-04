@@ -54,6 +54,7 @@ class Service:
         self.started_epoch = time.time()
         self.last_attempt_epoch: Optional[float] = None
         self.last_success_epoch: Optional[float] = None
+        self.next_poll_epoch: Optional[float] = None  # when the loop will poll next (for `status` / `verify`)
         self.failures = 0
         self.last_error = ""
         self.pending = 0
@@ -350,6 +351,7 @@ class Service:
             "interval": self.cfg.interval,
             "last_attempt_epoch": self.last_attempt_epoch,
             "last_success_epoch": self.last_success_epoch,
+            "next_poll_epoch": self.next_poll_epoch,
             "consecutive_failures": self.failures,
             "last_error": self.last_error,
             "pending_alerts": self.pending,
@@ -371,6 +373,8 @@ class Service:
             if hold > 0:
                 log.info("the last poll was under %d minutes ago; waiting %d s before polling again", MIN_POLL_SECONDS // 60, hold)
             next_poll = time.monotonic() + hold
+            self.next_poll_epoch = time.time() + hold
+            self.write_status()
             retry_at: Optional[float] = None
             while not self.stop.is_set():
                 now = time.monotonic()
@@ -382,6 +386,7 @@ class Service:
                     if delay > self.cfg.interval:
                         log.warning("next poll in %d s (stretched because of recent failures or a rate-limit request)", delay)
                     next_poll = max(began + delay, time.monotonic() + 5)
+                    self.next_poll_epoch = time.time() + max(0.0, next_poll - time.monotonic())
                     retry_at = time.monotonic() + self.cfg.notify_retry_seconds if self.pending else None
                 elif self.pending:
                     if retry_at is None:
