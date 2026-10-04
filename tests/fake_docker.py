@@ -30,8 +30,9 @@ DEFAULTS = {
     "verify_setup": "auto",            # auto = compare .env with what the wizard made | fail
     "up_rc": 0,
     "verify_rc": 0,
-    "verify_out": "  [ OK ] Service       running - ok (0 consecutive failed poll(s))\n"
-                  "  [ OK ] Wave cloud    last poll succeeded at 2026-10-04 22:46 UTC\n"
+    "verify_out": "  [ OK ] Service        running - ok (0 consecutive failed poll(s))\n"
+                  "  [ OK ] Wave cloud     last poll succeeded at 2026-10-04 22:46 UTC\n"
+                  "  [ OK ] Startup alert  \"bwwatch started\" was delivered at 2026-10-04 22:46 UTC\n"
                   "  [ OK ] Alert channels  ntfy\n",
     "wipe_rc": 0,
     "container": {"exists": False, "running": False, "owner": ""},
@@ -180,6 +181,11 @@ def compose(rest, sc, state) -> int:
         if sc["config"] == "fail":
             err("validating docker-compose.yml: services.bwwatch Additional property bogus is not allowed\n")
             return 1
+        if sc["config"] == "env_broken":
+            env = Path(project_dir or ".", ".env")
+            if env.exists() and "BROKEN" in env.read_text(encoding="utf-8"):
+                err("failed to read %s: line 3: unexpected character \"B\" in variable name\n" % env)
+                return 1
         return 0
 
     if sub == "build" and not args:

@@ -1,5 +1,8 @@
 # bwwatch - always-on Wave fault watcher.
 #
+#   Easiest:  ./install.sh     (guided: does everything below and checks each step)
+#
+# By hand:
 #   cp .env.example .env && chmod 600 .env     (then edit .env)
 #   docker compose build
 #   docker compose run --rm bwwatch login      (once: sign in through your browser)
@@ -8,7 +11,7 @@
 #
 # Everything it records lives in ./data (database, backups, the sign-in token).
 # Never run `docker compose down -v` on a setup you care about, and don't `cp` the live
-# .db file: use `docker compose exec bwwatch bwwatch backup` instead.
+# .db file: use `./bwctl backup` (or `docker compose exec bwwatch bwwatch backup`) instead.
 name: bwwatch
 
 services:

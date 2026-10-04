@@ -210,6 +210,7 @@ class Scripts(unittest.TestCase):
                      r"\bsudo\b", r"\bchown\b", r"/dev/shm", r"XDG_"]
         for name in ("install.sh", "bwctl"):
             for line in self.executed_lines(name):
+                line = line.replace("/etc/os-release", "")  # the one thing read from outside: which distribution this is
                 for pattern in forbidden:
                     self.assertIsNone(re.search(pattern, line), "%s runs something that reaches outside the folder: %s" % (name, line))
 
@@ -289,6 +290,27 @@ class Preflight(SandboxCase):
         self.assertIn("Docker is not installed", done.out)
         self.assertIn("docs.docker.com", done.out)
         self.assertNotIn(".env", box.listing() - box.baseline, "nothing is set up before Docker is confirmed")
+
+    def test_the_install_hint_names_docker_steps_for_this_distribution(self):
+        box = self.box()
+        (box.bin / "docker").unlink()
+        tools = box.base / "tools"
+        tools.mkdir()
+        for name in TOOLS:
+            found = shutil.which(name)
+            if found:
+                (tools / name).symlink_to(found)
+        done = box.run(stdin="y\n", path_dirs=[str(tools)])
+        distro = {}
+        try:
+            for line in Path("/etc/os-release").read_text().splitlines():
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    distro[key] = value.strip('"')
+        except OSError:
+            pass
+        expected = "https://docs.docker.com/engine/install/" + (distro.get("ID", "") + "/" if distro.get("ID") in ("debian", "ubuntu", "fedora", "raspbian") else "")
+        self.assertIn(expected, done.out)
 
     def test_daemon_not_running(self):
         box = self.box()
@@ -558,9 +580,49 @@ class Install(SandboxCase):
         self.assertIn("./bwctl test-notify", done.out)
         self.assertNotIn("bwwatch is installed and working", done.out)
 
+    def test_no_question_about_a_message_that_was_not_sent(self):
+        box = self.box()
+        box.scenario(verify_out="  [ OK ] Service  running\n  [ OK ] Startup alert  none was due this time (bwwatch sends at most one an hour)\n")
+        done = box.run(stdin="y\n")  # only the folder question: nothing else is asked
+        self.assertEqual(done.code, 0, done.text)
+        self.assertNotIn("message arrive", done.out)
+        self.assertIn("nothing more to confirm", done.out)
+        self.assertIn("bwwatch is installed and working", done.out)
+
+    def test_notes_are_not_called_failures(self):
+        box = self.box()
+        box.scenario(verify_out="  [ OK ] Service  running\n  [WARN] Backups  none yet\n  [ OK ] Startup alert  \"bwwatch started\" was delivered at 10:00\n")
+        done = box.run(stdin="y\ny\n")
+        self.assertEqual(done.code, 0, done.text)
+        self.assertIn("No problems found", done.out)
+        self.assertNotIn("Every check passed", done.out)
+
+    def test_a_env_file_docker_cannot_read_is_set_aside_not_a_dead_end(self):
+        box = self.box()
+        box.put_env("NTFY_TOPIC=keep-me\nBROKEN LINE\n")
+        box.scenario(config="env_broken")
+        done = box.run(stdin="y\ny\ny\ny\n")
+        self.assertEqual(done.code, 0, done.text)
+        self.assertIn("could not read your .env file", done.out)
+        self.assertIn("Continuing with a fresh .env", done.out)
+        backups = sorted(n for n in box.listing() if n.startswith(".env.bak-"))
+        self.assertTrue(backups)
+        self.assertIn("BROKEN LINE", (box.dir / backups[0]).read_text(encoding="utf-8"), "the old file is kept, not lost")
+        self.assertEqual(stat.S_IMODE(os.stat(box.dir / backups[0]).st_mode), 0o600)
+
+    def test_declining_to_set_a_broken_env_aside_changes_nothing(self):
+        box = self.box()
+        box.put_env("NTFY_TOPIC=keep-me\nBROKEN LINE\n")
+        box.scenario(config="env_broken")
+        done = box.run(stdin="y\nn\n")
+        self.assertEqual(done.code, 130)
+        self.assertEqual((box.dir / ".env").read_text(encoding="utf-8"), "NTFY_TOPIC=keep-me\nBROKEN LINE\n")
+        self.assertNotIn("compose build", box.kinds())
+
     def test_the_missing_fault_request_is_called_out_at_the_end(self):
         box = self.box()
-        box.scenario(verify_out="  [ OK ] Service  running\n  [WARN] Fault history  not configured: only settings and status flags are watched\n")
+        box.scenario(verify_out="  [ OK ] Service  running\n  [WARN] Fault history  not configured: only settings and status flags are watched\n"
+                                "  [ OK ] Startup alert  \"bwwatch started\" was delivered at 10:00\n")
         done = box.run(stdin="y\ny\n")
         self.assertEqual(done.code, 0)
         self.assertIn("Notifications request", done.out)
@@ -750,8 +812,9 @@ class Uninstall(SandboxCase):
         done = box.run("--uninstall", stdin="y\nDELETE\n")
         self.assertEqual(done.code, 0, done.text)
         kinds = box.kinds()
-        self.assertLess(kinds.index("compose run find"), kinds.index("compose down"), "data is erased while the image still exists")
-        self.assertLess(kinds.index("compose down"), kinds.index("image rm"))
+        self.assertLess(kinds.index("compose down"), kinds.index("compose run find"),
+                        "the service is stopped first: on its way out it writes into data/ again")
+        self.assertLess(kinds.index("compose run find"), kinds.index("image rm"), "data is erased while the image still exists")
         wipe = [c["argv"] for c in box.calls() if kind(c) == "compose run find"][0]
         self.assertEqual(wipe[wipe.index("--entrypoint"):], ["--entrypoint", "find", "bwwatch", "/data", "-mindepth", "1", "-delete"])
         self.assertFalse((box.dir / ".env").exists())

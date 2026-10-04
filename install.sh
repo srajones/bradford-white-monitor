@@ -162,10 +162,21 @@ check_folder() {
   return 0
 }
 
+# Docker's own install page for this distribution (a read of /etc/os-release, nothing more).
+docker_docs() {
+  # shellcheck source=/dev/null
+  _id=$( (. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}") 2>/dev/null)
+  case $_id in
+    debian|ubuntu|fedora|raspbian) printf 'https://docs.docker.com/engine/install/%s/' "$_id" ;;
+    *) printf 'https://docs.docker.com/engine/install/' ;;
+  esac
+}
+
 check_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     fail "Docker is not installed (the 'docker' command was not found)."
-    hint "Install Docker Engine with the Compose plugin:  https://docs.docker.com/engine/install/"
+    hint "Install Docker Engine together with the Compose plugin, following Docker's own steps for your system:"
+    hint "    $(docker_docs)"
     hint "(This installer never installs software for you.)"
     return 1
   fi
@@ -200,8 +211,9 @@ check_docker() {
   _v=$(docker compose version --short 2>/dev/null) || _v=''
   if [ -z "$_v" ]; then
     fail "Docker Compose v2 is missing (the 'docker compose' command does not work)."
-    hint "Install the Compose plugin, e.g.   sudo apt-get install docker-compose-plugin"
-    hint "or see https://docs.docker.com/compose/install/linux/   (the old 'docker-compose' is not supported)"
+    hint "Install the Compose plugin (package 'docker-compose-plugin'); Docker's own steps for your system are here:"
+    hint "    $(docker_docs)"
+    hint "(The old standalone 'docker-compose' is not supported.)"
     return 1
   fi
   _v=${_v#v}
@@ -231,6 +243,21 @@ check_compose_file() {
     ok "The Compose file is valid."
     return 0
   fi
+  case $_out in
+    *.env*|*"env file"*|*dotenv*|*"env_file"*)
+      warn "Docker could not read your .env file:"
+      printf '%s\n' "$_out" | head -n 4 | indent
+      hint "A hand-edited line is usually the cause. The guided setup can start again from a fresh file."
+      if ask_yes_no "Set this .env aside as .env.bak-$STAMP and continue with a fresh one?" y; then
+        mv -f "$DIR/.env" "$DIR/.env.bak-$STAMP" && cp "$DIR/.env.example" "$DIR/.env" && chmod 600 "$DIR/.env" "$DIR/.env.bak-$STAMP"
+        if _out=$(dc config -q 2>&1); then
+          ok "Continuing with a fresh .env (your old one is kept as .env.bak-$STAMP)."
+          return 0
+        fi
+      else
+        cancelled
+      fi ;;
+  esac
   fail "Docker could not read docker-compose.yml:"
   printf '%s\n' "$_out" | head -n 8 | indent
   hint "If it mentions an unknown key, your Docker Compose is probably too old; update the Compose plugin."
@@ -297,8 +324,8 @@ part1() {
 # ---------------------------------------------------------------------------------- Part 2: build
 part2() {
   heading "Part 2 of 4: Building the program"
-  say "Docker builds a small image (about 130 MB) from the files in this folder."
-  say "The first time it downloads a Python base image, so give it a minute or two."
+  say "Docker builds a small image from the files in this folder. It is almost all the Python base"
+  say "image, which is downloaded the first time, so give it a minute or two."
   printf 'Building'
   dc build >"$OUT" 2>&1 &
   BG_PID=$!
@@ -320,8 +347,7 @@ part2() {
     hint "The whole output is in $LOG"
     return 1
   fi
-  _size=$(docker image inspect -f '{{.Size}}' "$IMAGE" 2>/dev/null | awk '{printf "%d", $1 / 1048576}')
-  ok "Built the image $IMAGE${_size:+ ($_size MB)}."
+  ok "Built the image $IMAGE."
   return 0
 }
 
@@ -438,18 +464,26 @@ part4() {
     hint "bwwatch is still running. Fix the problem, then check again with:  ./install.sh --check"
     return 1
   fi
-  ok "Every check passed."
+  if grep -q '\[WARN\]' "$OUT" 2>/dev/null; then
+    ok "No problems found (the [WARN] lines above are notes, not failures)."
+  else
+    ok "Every check passed."
+  fi
   FAULT_UNSET=0
   if grep -q 'Fault history.*not configured' "$OUT" 2>/dev/null; then FAULT_UNSET=1; fi
 
   blank
-  say "bwwatch has just sent \"bwwatch started\" to your alert channel(s). (If you only chose Home"
-  say "Assistant, which is set to faults and problems, nothing is expected: answer y.)"
-  if ! ask_yes_no "Did the \"bwwatch started\" message arrive?" y; then
-    fail "Not confirmed: alerts are the whole point, so this is not finished."
-    hint "Send one now and watch your device:   ./bwctl test-notify"
-    hint "Then look at   ./bwctl logs   and fix the channel with   ./install.sh --reconfigure"
-    return 1
+  if grep -q 'Startup alert.*was delivered' "$OUT" 2>/dev/null; then
+    say "bwwatch has just sent \"bwwatch started\" to your alert channel(s)."
+    if ! ask_yes_no "Did the \"bwwatch started\" message arrive?" y; then
+      fail "Not confirmed: alerts are the whole point, so this is not finished."
+      hint "Send one now and watch your device:   ./bwctl test-notify"
+      hint "Then look at   ./bwctl logs   and fix the channel with   ./install.sh --reconfigure"
+      return 1
+    fi
+  else
+    say "No \"bwwatch started\" message was due this time, so there is nothing more to confirm: the alert"
+    say "channels were already tested, one by one, during the guided setup."
   fi
   return 0
 }
@@ -580,8 +614,10 @@ mode_uninstall() {
   if ! IFS= read -r _answer; then cancelled; fi
   if [ "$_answer" = DELETE ]; then _wipe=1; fi
 
-  # Compose reads .env even to stop a container, so .env goes last.
+  # Compose reads .env even to stop a container, so .env goes last. The service is stopped before its data
+  # is erased: on its way out it writes status.json and folds the database log into the database again.
   if [ ! -f "$DIR/.env" ]; then cp "$DIR/.env.example" "$DIR/.env"; fi
+  if dc down >"$OUT" 2>&1; then ok "Removed the container."; else warn "Docker said:"; tail -n 5 "$OUT" | indent; fi
   if [ "$_wipe" = 1 ]; then
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
       # the files in data/ belong to the container's own user, so the container removes them
@@ -596,8 +632,6 @@ mode_uninstall() {
       warn "Could not erase data/; remove it yourself:  sudo rm -rf \"$DIR/data\""
     fi
   fi
-
-  if dc down >"$OUT" 2>&1; then ok "Removed the container."; else warn "Docker said:"; tail -n 5 "$OUT" | indent; fi
   if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     if docker image rm "$IMAGE" >"$OUT" 2>&1; then ok "Removed the image $IMAGE."; else warn "Could not remove the image:"; tail -n 3 "$OUT" | indent; fi
   fi

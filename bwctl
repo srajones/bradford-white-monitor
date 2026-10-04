@@ -70,7 +70,6 @@ cmd=${1:-help}
 
 case $cmd in
   help|-h|--help) usage ;;
-  install)        exec "$DIR/install.sh" "$@" ;;
   reconfigure)    exec "$DIR/install.sh" --reconfigure ;;
   uninstall)      exec "$DIR/install.sh" --uninstall ;;
   start)          need_ready; dc up -d bwwatch ;;

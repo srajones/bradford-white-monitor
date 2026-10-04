@@ -59,6 +59,10 @@ def _snapshot(cfg: Config, since: Optional[float] = None) -> Dict[str, Any]:
         if since is not None:
             cutoff = iso(datetime.fromtimestamp(since, tz=timezone.utc))
             snap["fresh_polls"] = conn.execute("SELECT COUNT(*) FROM polls WHERE finished_at >= ?", (cutoff,)).fetchone()[0]
+            snap["startup_alert"] = conn.execute(
+                "SELECT status, sent_at, last_error FROM outbox WHERE title = 'bwwatch started' AND created_at >= ? ORDER BY id DESC LIMIT 1",
+                (cutoff,),
+            ).fetchone()
         snap["heaters"] = []
         for row in conn.execute("SELECT * FROM appliances ORDER BY name"):
             reading = conn.execute("SELECT * FROM readings WHERE mac = ? ORDER BY id DESC LIMIT 1", (row["mac"],)).fetchone()
@@ -102,6 +106,10 @@ def run_checks(
         settled = seen_poll_at is not None and (pending == 0 or clock() - seen_poll_at >= 15)
         if settled or clock() >= deadline:
             break
+        if since is not None and snap.get("fresh_service") and seen_poll_at is None:
+            hold = float((snap.get("status") or {}).get("next_poll_epoch") or 0) - now()
+            if hold > (deadline - clock()) + 2:  # the safeguard will not allow a poll before we would give up anyway
+                break
         if progress is not None and clock() - last_said >= 10:
             last_said = clock()
             if since is not None and not snap.get("fresh_service"):
@@ -180,6 +188,18 @@ def _evaluate(cfg: Config, snap: Dict[str, Any], since: Optional[float] = None, 
         checks.append(Check(WARN, "Alerts delivered", "%d alert(s) were dropped (no channel wanted them)" % dropped, "Check your channel settings"))
     else:
         checks.append(Check(WARN, "Alerts delivered", "none sent yet (the first ones go out after the first poll)"))
+
+    if since is not None and restarted:
+        row = snap.get("startup_alert")
+        if row is None:
+            checks.append(Check(OK, "Startup alert", "none was due this time (bwwatch sends at most one an hour)"))
+        elif row["status"] == "sent":
+            checks.append(Check(OK, "Startup alert", "\"bwwatch started\" was delivered at %s" % local_time(row["sent_at"], cfg.display_tz)))
+        elif row["status"] == "dropped":
+            checks.append(Check(OK, "Startup alert", "no channel wants it (they are set to faults and problems only)"))
+        else:
+            checks.append(Check(WARN, "Startup alert", "\"bwwatch started\" is waiting to be delivered%s" % (
+                " - last error: %s" % truncate(row["last_error"], 120) if row["last_error"] else ""), "Test your channels:  ./bwctl test-notify"))
 
     if cfg.fault_request is not None:
         checks.append(Check(OK, "Fault history", "reading %s" % cfg.fault_request.describe()))

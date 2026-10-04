@@ -1,6 +1,7 @@
 """The files around the code - env template, compose file, Dockerfile, README - stay correct and in sync."""
 from __future__ import annotations
 
+import os
 import re
 import unittest
 from pathlib import Path
@@ -107,6 +108,55 @@ class Readme(unittest.TestCase):
         self.assertEqual(BACKOFF_AFTER_FAILURES, 3)
         self.assertEqual(len(probe.PROBE_NAMES) + 2, 14)
         self.assertIn("about 14", README)
+
+
+class InstallerDocs(unittest.TestCase):
+    """The scripts and the README describe the same things."""
+
+    INSTALL = (ROOT / "install.sh").read_text(encoding="utf-8")
+    BWCTL = (ROOT / "bwctl").read_text(encoding="utf-8")
+
+    def test_every_installer_option_is_documented(self):
+        options = set(re.findall(r"^\s+(--[a-z]+)\)", self.INSTALL, flags=re.M)) | set(re.findall(r"^\s+-h\|(--[a-z]+)", self.INSTALL, flags=re.M))
+        self.assertEqual(options, {"--reconfigure", "--check", "--uninstall", "--help"})
+        for option in options:
+            self.assertTrue("`./install.sh %s`" % option in README, "%s is not in the README's installer table" % option)
+
+    def test_every_bwctl_command_is_documented(self):
+        body = self.BWCTL[self.BWCTL.index("case $cmd in"):]
+        labels = re.findall(r"^  ([a-z|*-]+)\)", body, flags=re.M)
+        names = {n for label in labels for n in label.split("|") if n.isalpha()}
+        self.assertTrue({"start", "stop", "restart", "logs", "update", "reconfigure", "uninstall"} <= names, names)
+        for name in names - {"help"}:
+            self.assertTrue("`%s" % name in README, "bwctl %s is not in the README" % name)
+        self.assertTrue("`./bwctl" in README)
+
+    def test_the_documented_folder_is_the_one_the_installer_expects(self):
+        self.assertIn("EXPECTED_DIR=/opt/bwheater", self.INSTALL)
+        self.assertGreater(README.count("/opt/bwheater"), 5)
+
+    def test_the_promises_made_in_the_readme_are_in_the_scripts(self):
+        for promise, evidence in (
+            ("umask 077", "private files"),
+            ("Everything stays inside this folder", "the confinement notice"),
+            ("never installs software", "no software is installed for you"),
+        ):
+            self.assertTrue(promise.lower() in (self.INSTALL + README).lower(), evidence)
+        self.assertTrue("headless browser" in README.lower())
+        self.assertTrue("no browser" in README.lower())
+
+    def test_scratch_and_backup_files_are_never_committed_or_sent_to_docker(self):
+        for name in (".gitignore", ".dockerignore"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            for pattern in ("install.log", ".install.out", ".env.new", ".env.bak-*"):
+                self.assertIn(pattern, text, "%s should list %s" % (name, pattern))
+
+    def test_the_scripts_are_executable_and_the_compose_file_points_at_them(self):
+        for name in ("install.sh", "bwctl"):
+            self.assertTrue(os.access(ROOT / name, os.X_OK), name)
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertTrue("./install.sh" in compose)
+        self.assertTrue("./install.sh" in ENV_EXAMPLE)
 
 
 @unittest.skipIf(yaml is None, "PyYAML not installed")

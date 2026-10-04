@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from bwwatch import cli
+from bwwatch.service import Service
 from bwwatch.verify import FAIL, OK, WARN, Check, format_checks, overall_ok, run_checks
 from bwwatch.wave import check_reachable
 
@@ -178,6 +179,51 @@ class SinceRestart(WaveTestCase):
         checks = run_checks(cfg, since=since)
         self.assertEqual(by_name(checks)["First poll"][0].status, FAIL)
 
+    def test_the_startup_alert_is_reported_so_the_installer_knows_whether_to_ask(self):
+        cfg = self.cfg()
+        since = time.time() - 1
+        Verify.poll_once(self, cfg)
+        alert = by_name(run_checks(cfg, since=since))["Startup alert"][0]
+        self.assertEqual(alert.status, OK)
+        self.assertIn("was delivered at", alert.detail)
+        self.assertNotIn("Startup alert", by_name(run_checks(cfg)), "only asked about for a fresh start")
+
+    def test_an_undelivered_startup_alert_is_a_warning_with_the_reason(self):
+        self.mock.sink_status["ntfy"] = 500
+        cfg = self.cfg()
+        since = time.time() - 1
+        Verify.poll_once(self, cfg)
+        alert = by_name(run_checks(cfg, since=since))["Startup alert"][0]
+        self.assertEqual(alert.status, WARN)
+        self.assertIn("waiting to be delivered", alert.detail)
+        self.assertIn("500", alert.detail)
+        self.assertIn("./bwctl test-notify", alert.fix)
+
+    def test_channels_that_only_want_faults_get_no_startup_alert_and_that_is_fine(self):
+        cfg = self.cfg(NTFY_EVENTS="fault,health")
+        since = time.time() - 1
+        Verify.poll_once(self, cfg)
+        alert = by_name(run_checks(cfg, since=since))["Startup alert"][0]
+        self.assertEqual(alert.status, OK)
+        self.assertIn("faults and problems only", alert.detail)
+
+    def test_a_quick_restart_sends_no_startup_alert_and_that_is_reported_as_such(self):
+        cfg = self.cfg()
+        first, _ = Verify.poll_once(self, cfg)
+        first.shutdown()
+        time.sleep(1.1)  # stamps have one-second precision: put the restart clearly after the first start's alert
+        since = time.time()
+        svc = Service(cfg)
+        svc.tokens.retry_after = 0
+        svc.open()
+        self.addCleanup(svc.shutdown)
+        svc.startup(None)  # the previous start was moments ago: the once-an-hour notice is not repeated
+        svc.cycle()
+        svc.write_status()
+        alert = by_name(run_checks(cfg, since=since))["Startup alert"][0]
+        self.assertEqual(alert.status, OK)
+        self.assertIn("none was due", alert.detail)
+
     def test_the_service_publishes_when_it_will_poll_next(self):
         cfg = self.cfg()
         svc, _ = Verify.poll_once(self, cfg)
@@ -218,7 +264,7 @@ class Waiting(unittest.TestCase):
         def __call__(self):
             return self.now
 
-    def run_with(self, snapshots, wait):
+    def run_with(self, snapshots, wait, since=None, now=0.0):
         clock = self.Clock()
         feed = iter(snapshots)
         last = {}
@@ -232,7 +278,8 @@ class Waiting(unittest.TestCase):
 
         cfg = mock.Mock(display_tz="UTC", channel_names=("ntfy",), fault_request=None, heartbeat_url="")
         with mock.patch("bwwatch.verify._snapshot", side_effect=next_snapshot), mock.patch("bwwatch.verify._evaluate", side_effect=lambda c, s, since=None, now=0: s):
-            result = __import__("bwwatch.verify", fromlist=["run_checks"]).run_checks(cfg, wait=wait, sleep=clock.sleep, clock=clock)
+            result = __import__("bwwatch.verify", fromlist=["run_checks"]).run_checks(
+                cfg, wait=wait, sleep=clock.sleep, clock=clock, since=since, now=lambda: now)
         return result, clock
 
     def test_without_a_wait_it_looks_once(self):
@@ -251,6 +298,20 @@ class Waiting(unittest.TestCase):
         self.assertEqual(result["outbox"], {"pending": 2})
         self.assertGreaterEqual(clock.now, 15)
         self.assertLess(clock.now, 30, "gives the alerts 15 seconds, not the whole wait")
+
+    def test_it_does_not_wait_for_a_poll_the_safeguard_will_not_allow_in_time(self):
+        snaps = [{"polls": 3, "fresh_polls": 0, "fresh_service": True, "status": {"next_poll_epoch": 1000.0 + 250}}]
+        result, clock = self.run_with(snaps, wait=150, since=900.0, now=1000.0)
+        self.assertEqual(clock.sleeps, [], "no point waiting 150 s for a poll that is 250 s away")
+
+    def test_it_does_wait_when_the_held_back_poll_is_due_within_the_wait(self):
+        snaps = [{"polls": 3, "fresh_polls": 0, "fresh_service": True, "status": {"next_poll_epoch": 1000.0 + 20}},
+                 {"fresh_polls": 0}, {"fresh_polls": 0}, {"fresh_polls": 0}, {"fresh_polls": 0}, {"fresh_polls": 0},
+                 {"fresh_polls": 0}, {"fresh_polls": 0}, {"fresh_polls": 0}, {"fresh_polls": 0}, {"fresh_polls": 0},
+                 {"fresh_polls": 1, "outbox": {"pending": 0}}]
+        result, clock = self.run_with(snaps, wait=150, since=900.0, now=1000.0)
+        self.assertGreater(len(clock.sleeps), 5)
+        self.assertEqual(result["fresh_polls"], 1)
 
     def test_it_gives_up_at_the_deadline_when_no_poll_ever_happens(self):
         result, clock = self.run_with([{"polls": 0}], wait=20)
