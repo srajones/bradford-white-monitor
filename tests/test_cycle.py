@@ -7,9 +7,7 @@ import unittest
 from unittest import mock
 
 from bwwatch import cycle as cycle_module
-from bwwatch.config import Config
 from bwwatch.cycle import FetchResult, apply_cycle, fetch
-from bwwatch.service import Service
 from bwwatch.wave import TokenStore
 
 from .helpers import MAC, WaveTestCase

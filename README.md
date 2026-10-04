@@ -1,43 +1,382 @@
 # bwwatch — Bradford White Wave fault watcher
 
-A small, always-on Docker Compose service for a VPS. It signs in to the
-Bradford White **Wave** cloud (the same service the phone app talks to), checks
-your water heater for fault codes on a schedule (hourly by default), **logs
-every fault to a crash-safe SQLite database**, and **pushes a notification to
-your phone** — because the Android app doesn't.
+A small, always-on Docker Compose service for a VPS (or any always-on machine). It signs in to the
+Bradford White **Wave** cloud — the same service the phone app uses — checks your water heater about
+once an hour, **logs every fault to a crash-safe database**, and **alerts you** by push notification,
+email, Telegram or a **Home Assistant** webhook. It exists because the Android app doesn't send push
+notifications for faults.
 
-> **Status: work in progress.** This first commit sets up the repository, the
-> safety rules for secrets, and the plan. The watcher, `Dockerfile` and
-> `docker-compose.yml` land in the following commits, and this README is
-> updated as each piece lands. Nothing below is claimed to work until it says so
-> in the "Status" notes of the relevant section.
+- **Read-only.** It cannot change a setting on your water heater. This is enforced in code, not by good
+  behaviour — see [Read-only guarantee](#read-only-guarantee).
+- **Gentle.** About 4 small requests per hour, never more often than every 5 minutes —
+  see [How often it contacts Bradford White](#how-often-it-contacts-bradford-white).
+- **Hard to corrupt.** SQLite in WAL mode with full fsync, one transaction per poll, integrity checks,
+  verified backups, automatic recovery — see [Your data](#your-data-and-how-it-is-protected).
+- **Never silent.** If it can't sign in or can't reach Wave, it tells you, instead of looking like
+  "no faults".
+- **Light.** One ~126 MB container, Python standard library only (nothing to `pip install`), about 25 MB of RAM.
+- **No password on the server.** You sign in once in your own browser; only a revocable token is kept.
 
-## Goals
+> **One thing is still yours to find:** the exact request the app's *Notifications* tab uses is not
+> publicly documented. Until you set it (see [Finding the fault request](#finding-the-fault-request)),
+> bwwatch records the heater's settings and watches the status data for fault-looking fields, but it can't
+> read the notification list. Everything else works from day one.
 
-| Need | How it is handled |
-|------|-------------------|
-| Know when a fault code appears | Push notification (ntfy / Telegram / email / webhook), sent once per new fault |
-| Keep a record of every fault | Append-only `faults` table in SQLite, plus a CSV export for the plumber / warranty claim |
-| Never corrupt the log | SQLite in WAL mode with `synchronous=FULL`, one atomic transaction per poll, integrity checks, automatic verified backups, clean shutdown on `SIGTERM` |
-| Never fail silently | The watcher alerts you when *it* can't log in or reach the API, and (optionally) pings an external dead-man's-switch |
-| Lightweight | One small container, Python standard library only (no pip dependencies, no extra services) |
+---
 
-## Secrets
+## Quick start
 
-Everything sensitive lives in a `.env` file **on your VPS only**:
+You need Docker with Compose v2 (the `docker compose` command) on the server. The steps run on the server.
 
-- `.env` is git-ignored — see [`.gitignore`](.gitignore). Only `.env.example`
-  (placeholders, no real values) is ever committed.
-- Do not paste your Wave password, tokens, or a login redirect URL into chat,
-  issues or pull requests.
-- Lock the file down on the server: `chmod 600 .env`.
+```bash
+# (the repository is private: authenticate with your GitHub login/token or a deploy key)
+git clone https://github.com/srajones/bwwhitefaultcode.git && cd bwwhitefaultcode
+cp .env.example .env && chmod 600 .env      # then edit .env  (step 1)
+docker compose build                        # about a minute the first time (downloads the Python base image)
+docker compose run --rm bwwatch login      # step 2: sign in once, in your browser
+docker compose run --rm bwwatch test-notify   # step 3: does a test alert reach your phone?
+docker compose run --rm bwwatch check      # step 4: read everything once
+docker compose up -d                        # step 5: run it, always
+```
 
-## Planned layout
+**1. Choose where alerts go** (edit `.env`). The quickest is [ntfy](https://ntfy.sh): install the ntfy app,
+make up a long random topic name (`openssl rand -hex 12`), put it in `NTFY_TOPIC=`, and subscribe to that
+topic in the app. Telegram, email, a generic webhook and Home Assistant work too — all documented in
+[`.env.example`](.env.example). **No Wave password goes in `.env`.**
+
+**2. Sign in once.** `login` prints a link. Open it in a browser, sign in with your normal Wave account,
+and the browser will end on an error page — that's expected (it's trying to open the phone app). Open the
+browser's developer tools (F12 → Network tab), reload if the list is empty, click the failed/302 request,
+and copy the value of its **`location`** response header — it starts with
+`com.bradfordwhiteapps.bwconnect://oauth/redirect?...`. Paste it back into the terminal. The code in it
+works once and expires within minutes, so do this promptly. (The community
+[Home Assistant integration](https://github.com/gclenaghan/ha-bradford-white-wave#authentication) uses the
+same flow and has a screenshot.) You'll see your heater listed when it works.
+
+**3. `test-notify`** sends a test alert to every channel. If it doesn't reach your phone, fix that now —
+alerts are the whole point.
+
+**4. `check`** signs in, reads the heater once and prints what bwwatch understands: your settings
+(mode, setpoint), the fault history if configured, and your alert channels. It writes nothing.
+
+**5. `up -d`** starts it. Within a minute you should get *"bwwatch started"* and *"Watching …"* on your
+phone. From then on: a new fault → an alert within the hour.
+
+---
+
+## Finding the fault request
+
+The Notifications tab in the app loads its list with a request that nobody has published. You need its
+path (and parameters) once. The known calls look like this, so the missing one probably does too:
 
 ```
-bwwatch/            Python package (stdlib only)
-tests/              Unit + integration tests, including a mock Wave server
-Dockerfile
-docker-compose.yml
-.env.example
+GET /wave/getApplianceList?username=<your account id>
+GET /wave/getApplianceStatus?macAddress=<heater MAC>
 ```
+
+**Option A — read it out of the app (no traffic capture needed).** The Wave app is built with Flutter
+(the community client identifies itself as `Dart/3.8`). Flutter apps ignore a phone's proxy settings and
+don't trust user-installed certificates, so ordinary capture apps usually show nothing useful. But Flutter
+keeps API paths as plain text in the app's `libapp.so`:
+
+```bash
+adb shell pm list packages | grep -i -E 'bradford|wave'     # find the package name
+adb shell pm path <package>                                  # then `adb pull` each path it prints
+unzip -p base.apk lib/arm64-v8a/libapp.so > libapp.so        # (the split that contains lib/)
+strings -n 6 libapp.so | grep -i -E '/wave/|get[A-Za-z]*(Notif|Fault|Alert|Alarm|Event|History)'
+```
+
+You're looking for another `get…` name next to `getApplianceList` / `getApplianceStatus`, such as
+`getNotifications`. (This is a general technique; it may not work on every build.)
+
+**Option B — capture the app's traffic** on a rooted phone or an emulator, using a tool that can bypass
+Flutter's certificate handling (e.g. reFlutter or a Frida script). Heavier, but shows the exact request.
+
+**Option C — let bwwatch guess.** `docker compose run --rm bwwatch probe --yes` sends about 14 read-only
+`GET`s (guessed names such as `getNotifications`, `getFaultHistory`, 3 seconds apart, once) and reports
+any that exist. It only ever sends `get…` requests that pass the read-only guard. It may find nothing.
+
+**Then test and set it:**
+
+```bash
+docker compose run --rm bwwatch call "GET /wave/getNotifications?username={account_id}&macAddress={mac}"
+```
+
+When the answer is your notification list, put the same text in `.env`:
+
+```
+BW_FAULT_REQUEST=GET /wave/getNotifications?username={account_id}&macAddress={mac}
+```
+
+Placeholders: `{account_id}` `{mac}` `{serial}` `{name}`. For a `POST`, add a JSON body:
+`BW_FAULT_REQUEST=POST /wave/getNotifications {"mac_address": "{mac}"}`. Then run `check` — it should list
+the existing entries — and `docker compose up -d` again.
+
+On the first poll after you set it, existing entries are recorded as *pre-existing* without alerting
+(one summary message tells you the most recent ones). Only entries that appear after that raise an alert.
+If the notification list also holds non-fault messages, narrow it with `BW_FAULT_MATCH` (a regular
+expression). If `check` says it can't recognise the response format, set `BW_FAULT_LIST_PATH` (and, if
+needed, the other `BW_FAULT_*` options) — the raw response is stored either way, so nothing is lost.
+Even an unrecognised response still triggers an alert when it *changes*.
+
+---
+
+## Home Assistant
+
+bwwatch can call a **webhook** in Home Assistant whenever a fault is detected.
+
+**1. Create an automation** with a webhook trigger (Settings → Automations → Create → *Webhook*), or paste
+this YAML (Home Assistant 2024.10+; older versions use `trigger:` / `platform:` / `service:`):
+
+```yaml
+alias: Water heater fault
+description: Sent by bwwatch when the Wave cloud reports a new fault
+triggers:
+  - trigger: webhook
+    webhook_id: "PASTE-A-LONG-RANDOM-ID"   # works like a password - make it long and keep it secret
+    allowed_methods: [POST]
+    local_only: false                      # REQUIRED: bwwatch calls from the internet
+conditions:
+  - condition: template
+    value_template: "{{ trigger.json.event == 'fault' }}"
+actions:
+  - action: notify.mobile_app_YOUR_PHONE
+    data:
+      title: "{{ trigger.json.title }}"
+      message: "{{ trigger.json.message }}"
+      data: { priority: high, ttl: 0 }
+mode: queued
+```
+
+> Webhook triggers default to *local network only*, and Home Assistant doesn't tell the caller when it
+> ignores a webhook, so a wrong setting can fail silently. Leave `local_only: false` (UI: turn off *Only
+> accessible from the local network*).
+
+**2. Give the server a way to reach it.** A VPS can't see your home network. Options:
+- **Home Assistant Cloud (Nabu Casa):** enable the cloud hook for the webhook (Settings → Home Assistant
+  Cloud → Webhooks, or the *Public URL* button in the trigger; menus move between versions) to get an
+  `https://hooks.nabu.casa/…` address.
+- **Tailscale** (or WireGuard) on both machines: use the private address,
+  `http://100.x.y.z:8123/api/webhook/<id>`. The tunnel encrypts it.
+- Your own HTTPS reverse proxy or Cloudflare Tunnel. Don't expose plain-HTTP Home Assistant to the internet.
+
+**3. Put the address in `.env`:**
+
+```
+HA_WEBHOOK_URL=https://hooks.nabu.casa/<long-id>        # or https://your-ha.example/api/webhook/<id>
+HA_WEBHOOK_EVENTS=fault,health                            # optional: only these kinds (default: all)
+```
+
+**4. Test it** without waiting for a real fault: `docker compose run --rm bwwatch test-notify --event fault`
+sends a clearly labelled test fault (code `99`) to every channel; open the automation's *Traces* to see it.
+
+**What your automation receives** (`trigger.json`):
+
+| Field | Meaning |
+|-------|---------|
+| `source` | always `"bwwatch"` |
+| `event` | `fault` · `health` (bwwatch is failing / needs sign-in) · `recovered` · `cleared` · `setting` (mode/setpoint changed) · `info` |
+| `title`, `message` | ready-to-show text |
+| `priority` | 1 (quiet) … 5 (urgent) |
+| `time` | when bwwatch created the alert (UTC) |
+| `appliance` | `{name, mac, serial}` — on fault alerts |
+| `fault` | `{id, code, description, occurred_at, detected_at, kind, source}` — on fault alerts |
+
+Examples: `{{ trigger.json.fault.code }}`, `{{ trigger.json.appliance.name }}`. The webhook address is never
+written to logs or error messages.
+
+---
+
+## How often it contacts Bradford White
+
+**bwwatch never talks to the water heater itself.** It talks to Bradford White's cloud — the same servers
+the phone app uses — and the heater keeps talking to that cloud on its own. There is no push feed available
+to it, so bwwatch checks on a timer and is completely idle in between (no connection is kept open).
+
+Per poll, with the default hourly schedule and one heater:
+
+| Request | Per poll | Per day |
+|---------|---------:|--------:|
+| Sign-in token refresh (Microsoft Azure sign-in server, `consumer.bradfordwhiteapps.com`) | 1 | 24 |
+| `getApplianceList` | 1 | 24 |
+| `getApplianceStatus` (per heater) | 1 | 24 |
+| Your fault/notification request (once configured) | 1 | 24 |
+| **Total** | **4** | **96** |
+
+For comparison, the community Home Assistant integration (from its source) polls status every 60 seconds
+(list + status) plus energy usage every 5 minutes — roughly **3,700 requests a day** for one heater.
+bwwatch's default is about 1/40th of that, and even at its fastest allowed setting it is under a third.
+
+Built-in limits (all enforced in code and covered by tests):
+
+- **Never faster than every 5 minutes** (`BW_POLL_INTERVAL_SECONDS` below 300 is rejected) — and that
+  floor holds *across restarts*, so a crash loop or repeated `docker restart` can't cause rapid polling.
+- **Obeys `429 Too Many Requests`** and its `Retry-After` — no retry within the poll, and the next poll waits.
+- **Backs off** after 3 failed polls in a row (never *faster*; with the hourly default it stays hourly).
+- **Retries are tiny:** at most 3 attempts per request, a few seconds apart, only for network/5xx errors.
+- **Stops hammering a rejected sign-in:** after the sign-in server refuses your token, bwwatch alerts you
+  and does *not* contact it again until you run `login` (plus one retry every 6 hours in case it was a hiccup).
+- The only commands that send more than a handful of requests are the ones you run by hand: `probe`
+  (about 14, once, only with `--yes`).
+
+Honest limits: Bradford White doesn't publish rate limits, so nobody can *promise* you won't be limited or
+blocked — only that this is far below what the common integration already does. Cloud services also
+sometimes treat datacenter (VPS) addresses more suspiciously than home ones. If `check` is refused from the
+server but works from home, run the same compose file on a Raspberry Pi or home PC instead.
+
+---
+
+## Read-only guarantee
+
+You asked that this tool never change your heater's configuration. The Wave API changes settings with
+ordinary `GET` requests (`changeSetpoint`, `changeOpMode`), so "only GET" would not be enough. Instead:
+
+- Every request to the Wave API passes [`bwwatch/readonly.py`](bwwatch/readonly.py) — a short file you can read
+  in a few minutes — **when your settings are loaded and again immediately before sending**, before any
+  sign-in or network traffic.
+- A request is refused if its method isn't `GET`/`POST`; if *any* path segment contains an action word
+  (`change`, `set`, `update`, `delete`, `reset`, `clear`, `ack`, …); if the endpoint name doesn't read as a
+  read (`get…`, `list…`, `…history`, `…notifications`); if the query/body carries `temperature`, `mode`,
+  `setpoint`; or if a `{placeholder}` sits in the path.
+- **There is no setting, flag or environment variable that turns this off.** The commands `call` and
+  `probe` use the same guard.
+- The only other things it sends: the sign-in token refresh (OAuth), your own alerts, and the optional
+  heartbeat ping.
+- It reads what the status call returns — mode, setpoint, and any temperature fields — and records them
+  every poll. (Per the community client's notes, the status response does **not** include the tank
+  temperature; any temperature field that does appear is recorded.)
+
+Tests prove this: write endpoints are refused before anything is sent, a mock server that *would* change the
+heater is never touched during normal operation, and a source-level test ensures nothing else can open a
+connection to the Wave host. The one caveat is inherent: the guard judges endpoint **names**, and the API is
+undocumented. That's why only the two built-in reads plus the single request *you* configure are ever used —
+paste only a request the app makes when it merely *shows* notifications. If a genuine read is refused because
+its name isn't recognisable, that is deliberately a code change (add the word in `readonly.py`), not a setting.
+
+---
+
+## Your data and how it is protected
+
+Everything lives in `./data` on the host (a plain folder, so `docker compose down -v` and image rebuilds
+can't delete it):
+
+| File | What |
+|------|------|
+| `bwwatch.db` (+ `-wal`, `-shm`) | the log: every poll, fault, setting reading, queued alert |
+| `backups/` | verified copies, daily, newest 14 kept |
+| `token.json` | the rotating sign-in token (private, never in backups or exports) |
+| `corrupt/` | a damaged database, if one is ever found (kept, never deleted) |
+| `status.json`, `bwwatch.lock` | liveness and single-instance lock |
+
+**Why an unexpected shutdown can't corrupt it:**
+- SQLite in **WAL mode with `synchronous=FULL`**: a commit is on disk before it is acknowledged; a crash or
+  power loss can lose an *unfinished* write but never leaves the file half-written.
+- **One transaction per poll.** The poll, its faults, its readings *and the alerts they require* commit
+  together. A fault is therefore never recorded without its alert being queued, and a half-finished poll
+  simply doesn't exist and is redone.
+- Alerts are queued in the database and retried until delivered, so a network outage can't lose one.
+- The token file is replaced atomically (write, fsync, rename), and a rotated token is saved *before* use.
+- **Integrity check at start-up and daily; verified backups** made with SQLite's online backup API (never by
+  copying a live file). If damage is ever found, the file is moved to `corrupt/`, the newest good backup is
+  restored, and you get an alert.
+- `docker stop` shuts down cleanly (finishes the write, folds the WAL into the database). A hard kill is
+  survived too.
+
+**Tested, not just claimed:** repeated `kill -9` at random moments while the service writes as fast as it
+can; after every kill the database reopens cleanly, passes `integrity_check`, keeps every commit it had
+acknowledged, and satisfies cross-table invariants. The same tests *fail* if the transactions are sabotaged.
+The real container was also hard-killed and restarted by Docker. What a test can't prove is a **power cut**:
+that depends on your VPS's disk honouring `fsync` (which `synchronous=FULL` relies on). On a VPS this is
+normally fine; for extra safety copy `./data/backups` off the machine now and then (they're consistent files,
+safe to `rsync`; they contain your appliance details but no sign-in token).
+
+**Rules of thumb:** don't `cp` the live `bwwatch.db` (use `docker compose exec bwwatch bwwatch backup`);
+don't put `./data` on a network share; keep one instance running (a second one refuses to start).
+
+**Restoring by hand** (normally unnecessary — it self-recovers):
+
+```bash
+docker compose stop
+cp data/backups/bwwatch-<timestamp>.db data/bwwatch.db
+rm -f data/bwwatch.db-wal data/bwwatch.db-shm
+docker compose up -d
+```
+
+**Privacy:** the database holds your heater's name, MAC address, serial number and the raw responses. Treat
+exports (`export faults`) and backups accordingly before sharing them with a plumber or on a forum.
+
+---
+
+## Day-to-day commands
+
+Run inside the container: `docker compose exec bwwatch bwwatch <command>` (or `docker compose run --rm bwwatch <command>` when it isn't running).
+
+| Command | What it does |
+|---------|--------------|
+| `status` | one-screen summary: service health, last poll, heater settings, faults, pending alerts, backups |
+| `faults [--limit N] [--all] [--raw]` | the logged faults, newest first |
+| `export faults\|polls\|readings [--out FILE]` | CSV, e.g. for a warranty claim: `docker compose exec -T bwwatch bwwatch export faults > faults.csv` |
+| `check` | read everything once and show what bwwatch understands (writes nothing) |
+| `login` | sign in again (needed if you get the *"sign-in needs attention"* alert) |
+| `call "<request>" [--mac MAC]` | one read-only request, answer printed — to try a request before putting it in `.env` |
+| `probe --yes` | look for the notifications endpoint (optional) |
+| `test-notify [--event fault]` | send a test alert to every channel |
+| `backup` · `dbcheck` | make a verified backup now · verify the database and list backups |
+| `healthcheck` | exit 0 if the service is alive (Docker uses this) |
+
+Logs: `docker compose logs -f`. Update: `git pull && docker compose build && docker compose up -d`.
+Stop: `docker compose stop`.
+
+**Alerts you may receive:** *Water heater fault N — name* (a new fault); *Wave sign-in needs attention —
+faults are NOT being monitored* (run `login`); *Wave monitoring is failing* / *working again*;
+*Water heater setting changed* (e.g. mode `Heat Pump → Electric` — handy if the heater falls back);
+*Fault flag cleared*; *bwwatch database was damaged and has been recovered*; *Watching …* / *bwwatch
+started*. Faults are priority 4 by default (`FAULT_PRIORITY`).
+
+---
+
+## Troubleshooting
+
+- **"Wave sign-in needs attention."** The sign-in server rejected the saved token (refresh tokens can
+  expire or be revoked). Run `docker compose run --rm bwwatch login`. bwwatch pauses contacting the
+  sign-in server until you do.
+- **No alerts arrive.** `test-notify` shows each channel's result. For ntfy, check the topic name matches
+  exactly. For Home Assistant, check `local_only: false` and the automation's trace.
+- **`permission denied` on `./data`.** It's normally fixed automatically at start-up; if your host folder is
+  unusual, run `sudo chown -R 10001:10001 ./data`.
+- **`check` is blocked/403 from the server but works from home** — see the note on VPS addresses above.
+- **Something looks wrong.** `docker compose logs --tail 100`, then `status` and `dbcheck`.
+- **Using a different Wave account / starting over.** `docker compose down`, delete `./data/token.json`
+  (and `./data` to discard history), then `login` again.
+
+---
+
+## How it works
+
+```
+every hour:  refresh token ─▶ list appliances ─▶ status (+ fault request) ─▶ ONE transaction:
+                                 poll · settings · faults · queued alerts ─▶ deliver alerts ─▶ idle
+```
+
+`bwwatch/` is plain Python (3.9+, standard library only): `readonly.py` (the guard), `wave.py` (sign-in and
+API), `cycle.py` (one poll), `service.py` (the loop, backups, health), `db.py` (storage safety), `faults.py`
+(lenient parsing of the undocumented responses), `notify.py` (channels), `cli.py` (commands).
+
+Run the tests (no installs; about half a minute): `python3 -m unittest discover -s tests -t .`
+
+**What has been verified:** about 195 automated tests against a mock Wave cloud (sign-in rotation, retries,
+rate limits, all alert channels, failure alerts, kill-9 crash safety, privilege drop, the read-only guard),
+and the real Docker image/compose file — hardened settings, graceful stop, crash restart, `down -v` — run
+against that mock. **What has not:** the live Bradford White servers (no credentials were used), the real
+fault request (unknown), and real ntfy/Telegram/SMTP/Home Assistant services (tested against local
+imitations). Your first `check` is the real test.
+
+## Credits and disclaimer
+
+The sign-in flow and API calls were worked out by the community — thanks to Graham Clenaghan's MIT-licensed
+[ha-bradford-white-wave](https://github.com/gclenaghan/ha-bradford-white-wave) and
+[bradford-white-wave-client](https://github.com/gclenaghan/bradford-white-wave-client). bwwatch is an
+independent, read-only implementation and shares no code with them. It is unofficial and not affiliated with
+Bradford White; the API is undocumented and may change. It is a monitoring aid — **not a safety device.**
+Don't rely on it for anything where a missed alert could hurt someone (gas, leaks, scalding); install proper
+leak and temperature protection too.

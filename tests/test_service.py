@@ -11,12 +11,11 @@ from unittest import mock
 
 import bwwatch.service as service_module
 from bwwatch import db
-from bwwatch.config import MIN_POLL_SECONDS, Config, ConfigError
-from bwwatch.cycle import FetchResult
+from bwwatch.config import MIN_POLL_SECONDS, ConfigError
 from bwwatch.privs import AlreadyRunning, acquire_lock
 from bwwatch.service import Service, healthcheck
 
-from .helpers import MAC, WaveTestCase
+from .helpers import WaveTestCase
 
 
 class Pacing(WaveTestCase):

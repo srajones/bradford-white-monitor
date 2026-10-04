@@ -1,0 +1,58 @@
+# bwwatch - always-on Wave fault watcher.
+#
+#   cp .env.example .env && chmod 600 .env     (then edit .env)
+#   docker compose build
+#   docker compose run --rm bwwatch login      (once: sign in through your browser)
+#   docker compose run --rm bwwatch check      (read everything once, show what it sees)
+#   docker compose up -d
+#
+# Everything it records lives in ./data (database, backups, the sign-in token).
+# Never run `docker compose down -v` on a setup you care about, and don't `cp` the live
+# .db file: use `docker compose exec bwwatch bwwatch backup` instead.
+name: bwwatch
+
+services:
+  bwwatch:
+    build: .
+    image: bwwatch:local
+    container_name: bwwatch
+    restart: unless-stopped
+    # No `init: true` on purpose: bwwatch handles SIGTERM itself and never spawns child
+    # processes. A separate init (tini) running as root cannot signal the unprivileged service
+    # once capabilities are dropped, which would turn `docker stop` into a hard kill.
+    env_file: .env
+    environment:
+      DATA_DIR: /data # fixed here so .env cannot point it somewhere else
+    volumes:
+      - ./data:/data # a plain host folder: survives `down`, image rebuilds and `down -v`
+
+    # --- lock the container down; it only needs outbound HTTPS and its own data folder ---
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add: # used only for the first moments of start-up, to hand ./data to the unprivileged user
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 64
+    # no `ports:` - nothing listens, nothing can connect in
+
+    stop_grace_period: 40s # lets an in-flight request and database write finish on `docker stop`
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "bwwatch", "healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

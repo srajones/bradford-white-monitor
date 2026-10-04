@@ -149,6 +149,21 @@ def _first(flat: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
     return None
 
 
+_RELATIVE_TIME = re.compile(
+    r"(?i)\b(ago|just now|yesterday|today|tomorrow|now)\b|^\s*\d+\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)\s*$"
+)
+
+
+def _stable_time(occurred_at: Optional[str], raw: Any) -> Optional[str]:
+    """The time as an identity ingredient: absolute stamps only (never 'five minutes ago')."""
+    if raw in (None, ""):
+        return None
+    if occurred_at and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", occurred_at):
+        return occurred_at
+    text = str(raw).strip()
+    return None if _RELATIVE_TIME.search(text) else text
+
+
 def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
     if not isinstance(item, dict):
         text = truncate(str(item), 300)
@@ -182,12 +197,24 @@ def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
         ident_value = _first(flat, ID_KEYS)
         ident = str(ident_value) if ident_value is not None else None
 
-    if ident:
-        fingerprint = "id:" + ident
-    elif code and time_value not in (None, ""):
-        fingerprint = "ct:%s|%s" % (code, time_value)
+    if opts.id_fields and ident:
+        fingerprint = "id:" + ident  # the owner said which fields identify an entry: trust that alone
     else:
-        fingerprint = "h:" + digest(item, opts.volatile)[:32]
+        # An id alone is not trusted: if it were positional (0, 1, 2... newest first) a brand-new fault would
+        # reuse a known id and its alert would be missed. Adding the code and an absolute time makes that
+        # impossible; relative times ("2 hours ago") are left out because they change on every poll.
+        stable_time = _stable_time(occurred_at, time_value)
+        parts = []
+        if ident:
+            parts.append("id=" + ident)
+        if code:
+            parts.append("code=" + code)
+        if stable_time:
+            parts.append("at=" + stable_time)
+        if ident or (code and stable_time):
+            fingerprint = "|".join(parts)
+        else:
+            fingerprint = "h:" + digest(item, opts.volatile)[:32]
     return FaultEvent(fingerprint, code, truncate(description, 400) if description else None, occurred_at, raw_json)
 
 

@@ -1,0 +1,14 @@
+# Keep secrets and data out of the build context (and so out of the image).
+.env
+.env.*
+!.env.example
+data/
+.git
+.gitignore
+tests/
+**/__pycache__
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+token.json

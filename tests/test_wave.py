@@ -6,7 +6,7 @@ import time
 import unittest
 
 from bwwatch.errors import ApiError, AuthError, TransientError
-from bwwatch.wave import TokenManager, TokenStore, WaveApi, http_request, parse_redirect
+from bwwatch.wave import TokenManager, TokenStore, http_request, parse_redirect
 
 from .helpers import MAC, WaveTestCase
 from .mock_wave import REDIRECT
@@ -18,6 +18,7 @@ class ParseRedirect(unittest.TestCase):
     def test_accepted_forms(self):
         code = "abcdefghijklmnopqrstuvwxyz0123456789"
         for text in (CODE_URL % code, "  " + CODE_URL % code + "\n", '"%s"' % (CODE_URL % code),
+                     "location: " + CODE_URL % code, "Location:  " + CODE_URL % code,   # the whole header row
                      "code=%s&state=init" % code, code):
             with self.subTest(text[:30]):
                 self.assertEqual(parse_redirect(text)[0], code)

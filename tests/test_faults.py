@@ -61,7 +61,7 @@ class Normalize(unittest.TestCase):
     def test_nested_fault_object(self):
         ev = normalize_event({"id": "n1", "fault": {"code": "E4", "description": "Dry fire"}}, OPTS)
         self.assertEqual((ev.code, ev.description), ("E4", "Dry fire"))
-        self.assertEqual(ev.fingerprint, "id:n1")
+        self.assertEqual(ev.fingerprint, "id=n1|code=E4")
 
     def test_fingerprint_ignores_volatile_fields(self):
         first = normalize_event({"title": "Fault", "code": 10, "read": False, "age": "1 min ago"}, OPTS)
@@ -83,6 +83,28 @@ class Normalize(unittest.TestCase):
         ev = normalize_event({"weird_code": "X1", "when": "2026-01-02T03:04:05Z", "blurb": "hello", "uid": 77, "code": "ignored"}, opts)
         self.assertEqual((ev.code, ev.description, ev.occurred_at, ev.fingerprint), ("X1", "hello", "2026-01-02T03:04:05Z", "id:77"))
 
+    def test_a_positional_id_cannot_hide_a_new_fault(self):
+        # newest-first list whose "id" is just the row number: the new fault reuses id 0
+        before = normalize_event({"id": 0, "faultCode": 10, "timestamp": 1760000000}, OPTS)
+        new_fault = normalize_event({"id": 0, "faultCode": 7, "timestamp": 1760003600}, OPTS)
+        shifted_old = normalize_event({"id": 1, "faultCode": 10, "timestamp": 1760000000}, OPTS)
+        self.assertNotEqual(before.fingerprint, new_fault.fingerprint)
+        self.assertNotEqual(before.fingerprint, shifted_old.fingerprint)  # same fault, new row number: a duplicate, never a miss
+
+    def test_relative_times_do_not_make_an_entry_look_new_every_poll(self):
+        a = normalize_event({"id": 5, "faultCode": 10, "time": "5 minutes ago"}, OPTS)
+        b = normalize_event({"id": 5, "faultCode": 10, "time": "2 hours ago"}, OPTS)
+        self.assertEqual(a.fingerprint, b.fingerprint)
+        c = normalize_event({"faultCode": 10, "when": "yesterday", "msg": "x"}, OPTS)
+        d = normalize_event({"faultCode": 10, "when": "3 days ago", "msg": "x"}, FaultOptions(volatile=VOLATILE | {"when"}))
+        self.assertTrue(c.fingerprint.startswith("h:") and d.fingerprint.startswith("h:"))
+
+    def test_zone_less_absolute_times_still_identify_an_entry(self):
+        a = normalize_event({"faultCode": 10, "time": "2026-10-04 14:03:00"}, OPTS)
+        b = normalize_event({"faultCode": 10, "time": "2026-10-04 15:03:00"}, OPTS)
+        self.assertNotEqual(a.fingerprint, b.fingerprint)
+        self.assertEqual(a.fingerprint, "code=10|at=2026-10-04 14:03:00")
+
     def test_non_dict_entries_do_not_crash(self):
         ev = normalize_event("Fault 10 detected", OPTS)
         self.assertEqual(ev.description, "Fault 10 detected")
@@ -91,7 +113,7 @@ class Normalize(unittest.TestCase):
     def test_extract_dedupes_and_filters(self):
         payload = {"notifications": [{"id": 1, "msg": "fault 10"}, {"id": 1, "msg": "fault 10"}, {"id": 2, "msg": "software update"}]}
         events, _ = extract_events(payload, FaultOptions(match=re.compile("fault"), volatile=VOLATILE))
-        self.assertEqual([e.fingerprint for e in events], ["id:1"])
+        self.assertEqual([e.fingerprint for e in events], ["id=1"])
 
 
 class Digest(unittest.TestCase):
