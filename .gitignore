@@ -1,0 +1,30 @@
+# --- Secrets: never commit these -------------------------------------------
+.env
+.env.*
+!.env.example
+token.json
+*.pem
+*.key
+
+# --- Runtime data: SQLite DB, WAL/SHM sidecars, backups, token store -------
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# --- Editors / OS -----------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
