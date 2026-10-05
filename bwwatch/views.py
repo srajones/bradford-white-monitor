@@ -239,6 +239,51 @@ def cmd_energy(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_readings(cfg: Config, args: argparse.Namespace) -> int:
+    """Show recorded tank temperatures and operating settings over time."""
+    conn = open_db(cfg)
+    if conn is None:
+        print("No database yet - has the service run?")
+        return 1
+    try:
+        limit = getattr(args, "limit", 25)
+        rows = conn.execute(
+            """SELECT r.*, a.name AS appliance FROM readings r
+               LEFT JOIN appliances a ON a.mac = r.mac
+               ORDER BY r.id DESC LIMIT ?""",
+            (limit if limit > 0 else 500,),
+        ).fetchall()
+        if not rows:
+            print("No status readings recorded yet.")
+            return 0
+        several = len({r["mac"] for r in rows}) > 1
+        lines = []
+        for r in reversed(rows):
+            temps_str = "-"
+            if r["temps"]:
+                try:
+                    loaded = json.loads(r["temps"])
+                    temps_str = ", ".join("%s: %s°F" % (k, v) for k, v in loaded.items())
+                except Exception:
+                    temps_str = str(r["temps"])
+            sp = "%s°F" % r["setpoint_f"] if r["setpoint_f"] is not None else "-"
+            row = [
+                local_time(r["taken_at"], cfg.display_tz),
+                r["mode"] or "-",
+                sp,
+                temps_str,
+            ]
+            if several:
+                row.insert(1, r["appliance"] or r["mac"])
+            lines.append(row)
+        headers = ("TIME",) + (("HEATER",) if several else ()) + ("MODE", "SETPOINT", "TEMPERATURES")
+        print("Heater status readings (latest %d entries):" % len(rows))
+        print(table(headers, lines))
+    finally:
+        conn.close()
+    return 0
+
+
 def add_arguments(sub: Any) -> None:
     """The sub-commands this module provides (called by cli.build_parser)."""
     p = sub.add_parser("fields", help="list every field the cloud reports, with its current value and change count")
@@ -257,4 +302,6 @@ def add_arguments(sub: Any) -> None:
     p.add_argument("--limit", type=int, default=24, help="how many entries to show (default 24; 0 = all)")
     p.add_argument("--mac", help="filter by appliance mac address")
     p.add_argument("--element-only", action="store_true", help="only show intervals where the backup element fired")
+    p = sub.add_parser("readings", help="show recorded tank temperatures and operating settings over time")
+    p.add_argument("--limit", type=int, default=25, help="how many entries to show (default 25; 0 = all)")
 

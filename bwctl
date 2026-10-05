@@ -2,8 +2,12 @@
 # bwctl: everyday helper for bwwatch. Run it from anywhere:  /opt/bwheater/bwctl <command>
 #
 #   status                  one-screen summary (service, last poll, heater settings, faults)
+#   poll                    trigger an immediate manual poll and record everything to database
+#   readings                recorded temperatures and operating settings over time
 #   faults [--all] [--raw]  the faults it has logged
 #   energy [--view ...]     heat pump vs backup element electricity usage (kWh)
+#   report                  generate Markdown summary and CSV files in data/exports/
+#   sync                    sync backups and reports to Dropbox via rclone
 #   logs [-f]               what the service is doing (-f follows)
 #   verify                  is everything working? (the installer's check)
 #   test-notify [--event fault]   send a test alert to every channel
@@ -81,6 +85,16 @@ case $cmd in
     need_ready
     printf 'Rebuilding the image from the files in %s ...\n' "$DIR"
     dc build && dc up -d bwwatch && printf 'Done. Checking:\n' && dc exec -T bwwatch bwwatch verify --wait 60
+    ;;
+  sync)
+    need_ready
+    if ! command -v rclone >/dev/null 2>&1; then
+      die "rclone is not installed. Install it on your VPS with: curl https://rclone.org/install.sh | sudo bash"
+    fi
+    printf 'Syncing bwwatch backups and reports to Dropbox...\n'
+    rclone copy "$DIR/data/backups/" dropbox:WaterHeater/backups/
+    rclone copy "$DIR/data/exports/" dropbox:WaterHeater/reports/
+    printf 'Sync complete.\n'
     ;;
   *)              need_ready; in_service "$cmd" "$@" ;;
 esac

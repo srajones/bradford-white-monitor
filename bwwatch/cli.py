@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from . import __version__, views
 from .config import Config, ConfigError, RequestSpec, load_env_file
-from .cycle import describe_event, enqueue, fetch
+from .cycle import apply_cycle, deliver_outbox, describe_event, enqueue, fetch
 from .db import DB_NAME, DatabaseTooNew, backup_now, connect, init_schema, integrity_check, list_backups, open_database, table_counts, tx
 from .discover import CANDIDATES, forget, load, try_candidates
 from .errors import AuthError, WaveError
@@ -270,6 +270,35 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     return 1 if errors or problems else 0
 
 
+def cmd_poll(cfg: Config, args: argparse.Namespace) -> int:
+    """Perform a live check, write everything to the database, and deliver pending alerts."""
+    store, tokens, api = _make_api(cfg)
+    if not tokens.has_credentials():
+        print("Sign-in:  NOT SIGNED IN. Run:  ./bwctl login", file=sys.stderr)
+        return 1
+    conn, _ = open_database(cfg.data_dir)
+    try:
+        notifier = Notifier(cfg)
+        print("Running manual poll...")
+        fetched = fetch(cfg, api)
+        outcome = apply_cycle(conn, cfg, fetched)
+        delivered = deliver_outbox(conn, notifier, cfg)
+        print("Poll completed: %s" % ("ok" if outcome.ok else "FAILED"))
+        print("  %s" % outcome.summary())
+        for a in fetched.appliances:
+            reading = extract_reading(a.status) if a.status_fetched else None
+            summary = reading.summary() if reading else "no status"
+            print("  %s (%s): %s" % (a.name, a.mac, summary))
+        if outcome.new_faults:
+            for nf in outcome.new_faults:
+                print("  ALERT QUEUED: Fault %s - %s" % (nf.code or "-", nf.description or "-"))
+        if delivered > 0:
+            print("  Delivered %d alert(s) to %s" % (delivered, ", ".join(notifier.channels)))
+        return 0 if outcome.ok else 1
+    finally:
+        conn.close()
+
+
 def _print_fault_check(cfg: Config, payload: Any, indent: str) -> int:
     events, where = extract_events(payload, cfg.fault_options)
     if events is None:
@@ -477,6 +506,22 @@ def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(cfg: Config, args: argparse.Namespace) -> int:
+    from . import report
+    try:
+        out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else None
+        target = report.generate_report(cfg, out_dir)
+        print("Generated comprehensive report and CSV exports in: %s" % target)
+        print("  - %s" % (target / "report.md"))
+        print("  - %s" % (target / "faults.csv"))
+        print("  - %s" % (target / "readings.csv"))
+        print("  - %s" % (target / "energy.csv"))
+        return 0
+    except Exception as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+
+
 # --- housekeeping -----------------------------------------------------------
 def cmd_backup(cfg: Config, args: argparse.Namespace) -> int:
     conn = _open_existing_db(cfg)
@@ -650,6 +695,9 @@ COMMANDS: Dict[str, Callable[[Config, argparse.Namespace], int]] = {
     "changes": views.cmd_changes,
     "calls": views.cmd_calls,
     "energy": views.cmd_energy,
+    "readings": views.cmd_readings,
+    "poll": cmd_poll,
+    "report": cmd_report,
     "discover": cmd_discover,
     "healthcheck": cmd_healthcheck,
 }
@@ -668,6 +716,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_login = sub.add_parser("login", help="sign in to Wave and save the refresh token (supports automated login via .env)")
     p_login.add_argument("--auto", action="store_true", help="sign in automatically using credentials from .env without prompting")
     sub.add_parser("check", help="read everything once and show what bwwatch understands (writes nothing)")
+    sub.add_parser("poll", help="trigger an immediate manual poll and record everything to the database")
+    p_rep = sub.add_parser("report", help="generate a Markdown report and CSV files (faults, readings, energy)")
+    p_rep.add_argument("--out-dir", help="directory to save the report and CSVs (default: /data/exports)")
     p = sub.add_parser("call", help="make one read-only request and print the answer")
     p.add_argument("request", help="e.g. 'GET /wave/getApplianceStatus?macAddress={mac}'")
     p.add_argument("--mac", help="appliance to use for {mac} (default: your first appliance)")
