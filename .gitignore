@@ -34,3 +34,10 @@ install.log
 .install.out
 .env.new
 .env.bak-*
+
+# --- Downloaded app files used for reading the Wave app (see NEXT-STEPS.md): never commit these ---
+apk/
+*.apk
+*.apks
+*.xapk
+*.apkm

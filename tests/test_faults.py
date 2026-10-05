@@ -35,6 +35,23 @@ class FindList(unittest.TestCase):
                 self.assertEqual(found, [item])
                 self.assertEqual(got, where)
 
+    def test_the_wave_apps_own_key_names(self):
+        """The Wave app (v1.1.3371) reads `error_history` / `error_code` / `error_string` / `timestamp`."""
+        payload = {
+            "status_code": 200,
+            "message": "Success",
+            "error_history": [
+                {"error_code": 10, "error_string": "Superheat Fault", "timestamp": "2026-10-04T18:15:00Z"},
+                {"error_code": 3, "error_string": "Upper Thermistor Fault", "timestamp": "2026-09-30T02:00:00Z"},
+            ],
+        }
+        events, where = extract_events(payload, OPTS)
+        self.assertEqual(where, "error_history")
+        self.assertEqual([e.code for e in events], ["10", "3"])
+        self.assertEqual(events[0].description, "Superheat Fault")
+        self.assertEqual(events[0].occurred_at, "2026-10-04T18:15:00Z")
+        self.assertEqual(extract_events({"error_history": [], "message": "Success"}, OPTS)[0], [], "an empty history is 'no faults'")
+
     def test_empty_list_is_recognised_as_no_faults(self):
         self.assertEqual(find_event_list({"notifications": []})[0], [])
         self.assertEqual(find_event_list([])[0], [])

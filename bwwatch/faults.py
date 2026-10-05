@@ -42,7 +42,8 @@ def digest(obj: Any, volatile: FrozenSet[str] = frozenset()) -> str:
 
 # --- finding the list of entries -------------------------------------------
 PREFERRED_LIST_KEYS = (
-    "faults", "faulthistory", "faultlist", "notifications", "notificationlist", "alerts",
+    "faults", "faulthistory", "faultlist", "errorhistory", "errorlist", "errors",  # the Wave app: "error_history"
+    "notifications", "notificationlist", "alerts",
     "alarms", "events", "history", "items", "records", "results", "messages", "data",
 )
 
@@ -108,7 +109,8 @@ CODE_KEYS = (
     "faultnumber", "code", "fault", "error", "alarm", "alert",
 )
 TEXT_KEYS = (
-    "title", "subject", "headline", "faultdescription", "faultmessage", "description",
+    "title", "subject", "headline", "faultdescription", "faultmessage", "errorstring", "errordescription",
+    "errormessage", "errortext", "faultstring", "description",
     "message", "msg", "text", "body", "detail", "details", "summary", "name", "notification",
 )
 TIME_KEYS = (

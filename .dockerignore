@@ -18,3 +18,8 @@ install.log
 .install.out
 .env.new
 .env.bak-*
+apk/
+*.apk
+*.apks
+*.xapk
+*.apkm
