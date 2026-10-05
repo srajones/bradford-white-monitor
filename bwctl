@@ -86,12 +86,19 @@ case $cmd in
     printf 'Rebuilding the image from the files in %s ...\n' "$DIR"
     dc build && dc up -d bwwatch && printf 'Done. Checking:\n' && dc exec -T bwwatch bwwatch verify --wait 60
     ;;
+  report)
+    need_ready
+    mkdir -p "$DIR/data/exports"
+    chmod 777 "$DIR/data/exports" 2>/dev/null || true
+    in_service report "$@"
+    ;;
   sync)
     need_ready
     if ! command -v rclone >/dev/null 2>&1; then
       die "rclone is not installed. Install it on your VPS with: curl https://rclone.org/install.sh | sudo bash"
     fi
     mkdir -p "$DIR/data/backups" "$DIR/data/exports"
+    chmod 777 "$DIR/data/backups" "$DIR/data/exports" 2>/dev/null || true
     printf 'Generating fresh report & CSV exports...\n'
     in_service report
     printf 'Syncing bwwatch backups and reports to Dropbox...\n'

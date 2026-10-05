@@ -40,7 +40,7 @@ def _hand_over(data_dir: Path, uid: int, gid: int) -> None:
     _fix_owner(data_dir, uid, gid)
     for name in _KNOWN_FILES:
         _fix_owner(data_dir / name, uid, gid)
-    for sub in ("backups", "corrupt", "logs"):
+    for sub in ("backups", "corrupt", "logs", "exports"):
         root = data_dir / sub
         if root.is_dir() and not root.is_symlink():
             _fix_owner(root, uid, gid)
