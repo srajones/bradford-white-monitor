@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-from . import __version__, observe
+from . import __version__, discover, observe
 from .config import MIN_POLL_SECONDS, Config
 from .cycle import FetchResult, Outcome, apply_cycle, deliver_outbox, enqueue, fetch
 from .db import (
@@ -27,7 +27,7 @@ from .db import (
 from .errors import AuthError, WaveError
 from .notify import Message, Notifier
 from .privs import acquire_lock
-from .util import atomic_write_json, hours_since, iso, scrub
+from .util import atomic_write_json, hours_since, iso, parse_iso, scrub
 from .wave import TokenManager, TokenStore, WaveApi, http_request
 
 log = logging.getLogger("bwwatch.service")
@@ -85,8 +85,15 @@ class Service:
         return True
 
     def next_delay(self) -> float:
-        """Seconds until the next poll: the interval, stretched after failures or a 429, never below the floor."""
+        """Seconds until the next poll: the interval, stretched after failures or a 429, never below the floor.
+
+        While a Notifications entry is active, and for ``BW_FAULT_POLL_HOURS`` after it was first seen,
+        the interval is ``BW_FAULT_POLL_INTERVAL_SECONDS`` (still never below the 5-minute floor).
+        """
         interval = float(self.cfg.interval)
+        faster = self._active_fault_interval()
+        if faster is not None:
+            interval = min(interval, faster)
         delay = interval
         if self.failures >= BACKOFF_AFTER_FAILURES:
             cap = max(interval, BACKOFF_CAP_SECONDS)
@@ -95,6 +102,51 @@ class Service:
         if asked > 0:
             delay = max(delay, asked)
         return max(delay, float(MIN_POLL_SECONDS))
+
+    def _active_fault_interval(self) -> Optional[float]:
+        """Shorter interval while a fault entry is active, else None. Status-flag guesses do not count."""
+        if self.conn is None:
+            return None
+        try:
+            rows = self.conn.execute(
+                "SELECT first_seen_at FROM faults WHERE kind = 'event' AND state = 'active'"
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+        window = self.cfg.fault_poll_hours * 3600
+        now = time.time()
+        for row in rows:
+            try:
+                age = now - parse_iso(row[0]).timestamp()
+            except ValueError:
+                continue
+            if 0 <= age <= window:
+                return float(self.cfg.fault_poll_interval)
+        return None
+
+    def _resolve_fault(self, appliance):
+        """BW_FAULT_REQUEST is unset: reuse a learned form, or try the three known ones (at most daily)."""
+        assert self.conn is not None
+        learned = discover.load(self.conn)
+        if learned is not None:
+            return learned
+        # Tests set retry_delays to (0, 0) so a miss does not sit for 6 seconds. Production waits 3s between forms.
+        gap = 0.0 if tuple(getattr(self.api, "retry_delays", ())) == (0.0, 0.0) else discover.GAP_SECONDS
+        spec = discover.try_candidates(self.api, appliance, self.conn, self.stop, gap=gap)
+        if spec is not None:
+            with tx(self.conn):
+                enqueue(
+                    self.conn,
+                    kind="info",
+                    title="Notifications list found",
+                    body="bwwatch will read fault history with:\n%s\n"
+                    "Entries already in the list are recorded without an alert. "
+                    "Anything active, and anything new after this, alerts.\n"
+                    "To forget this and try again:  ./bwctl discover --reset" % spec.describe(),
+                    priority=3,
+                    now=iso(),
+                )
+        return spec
 
     def _mark_poll_started(self) -> None:
         """Remember when we last contacted the cloud, so restarts cannot cause rapid repeat polls."""
@@ -131,10 +183,10 @@ class Service:
                 "NO NOTIFICATION CHANNEL IS CONFIGURED: faults will be logged but nobody will be alerted. "
                 "Set NTFY_TOPIC (or Telegram / email / webhook) in .env."
             )
-        if cfg.fault_request is None:
+        if cfg.fault_request is None and (self.conn is None or discover.load(self.conn) is None):
             log.warning(
-                "BW_FAULT_REQUEST is not set: the fault/notification history is not being read yet, "
-                "only the settings and fault-like fields in the status data. See the README."
+                "BW_FAULT_REQUEST is not set: bwwatch will try GET /wave/getApplianceErrors on its own. "
+                "Until that answers, only the settings and fault-like fields in the status data are watched."
             )
         if not self.tokens.has_credentials():
             log.warning("not signed in yet: run  docker compose run --rm bwwatch login")
@@ -151,7 +203,9 @@ class Service:
                         __version__,
                         max(1, cfg.interval // 60),
                         ", ".join(self.notifier.channels) or "NONE",
-                        "configured" if cfg.fault_request else "NOT configured yet (BW_FAULT_REQUEST)",
+                        "learned" if discover.load(self.conn) else (
+                            "configured" if cfg.fault_request else "NOT configured yet (BW_FAULT_REQUEST)"
+                        ),
                     ),
                     priority=2,
                     now=now,
@@ -162,7 +216,9 @@ class Service:
             __version__,
             cfg.interval,
             ",".join(self.notifier.channels) or "none",
-            cfg.fault_request.describe() if cfg.fault_request else "not set",
+            cfg.fault_request.describe() if cfg.fault_request else (
+                discover.load(self.conn).describe() if discover.load(self.conn) else "not set (will try getApplianceErrors)"
+            ),
         )
 
     def shutdown(self) -> None:
@@ -193,7 +249,10 @@ class Service:
             )
         else:
             try:
-                fetched = fetch(self.cfg, self.api)
+                fetched = fetch(
+                    self.cfg, self.api,
+                    resolve_fault=None if self.cfg.fault_request is not None else self._resolve_fault,
+                )
                 self._auth_failed_at = None
             except AuthError as exc:
                 log.error("sign-in problem: %s", exc)

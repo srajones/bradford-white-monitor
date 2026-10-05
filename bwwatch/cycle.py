@@ -90,29 +90,48 @@ def _try(errors: List[str], label: str, fn: Callable[[], Any]) -> Tuple[bool, An
         return False, None
 
 
-def fetch(cfg: Config, api: WaveApi) -> FetchResult:
-    """Read the appliance list, each heater's status and (if configured) the fault history."""
+def fetch(
+    cfg: Config,
+    api: WaveApi,
+    *,
+    resolve_fault: Optional[Callable[["ApplianceData"], Optional[Any]]] = None,
+) -> FetchResult:
+    """Read the appliance list, each heater's status and (if configured or learned) the fault history.
+
+    ``resolve_fault``, given the first heater, may return a request to use when ``BW_FAULT_REQUEST``
+    is unset (the service uses it to try ``/wave/getApplianceErrors``). ``check`` does not pass one,
+    so it still writes nothing and does not guess.
+    """
     result = FetchResult(started_at=iso())
     items = api.list_appliances()  # signs in first; AuthError / TransientError propagate
     if not items:
         result.errors.append("the account has no appliances")
-    fault_spec = cfg.fault_request
-    if fault_spec is not None and not fault_spec.per_appliance:
-        ok, payload = _try(result.errors, "fault request", lambda: api.call(fault_spec))
-        result.account_faults, result.account_faults_fetched = payload, ok
+    prepared: List[ApplianceData] = []
     for item in items:
         mac = mac_of(item)
         if not mac:
             result.errors.append("an appliance in the list has no macAddress")
             continue
-        data = ApplianceData(
+        prepared.append(ApplianceData(
             mac=mac,
             name=str(item.get("friendlyName") or mac),
             serial=str(item.get("serialNumber") or ""),
             model=str(item.get("applianceType") or ""),
             listing=item,
-        )
-        ctx = {"mac": mac, "serial": data.serial, "name": data.name}
+        ))
+    fault_spec = cfg.fault_request
+    if fault_spec is None and resolve_fault is not None and prepared:
+        try:
+            fault_spec = resolve_fault(prepared[0])
+        except AuthError:
+            raise
+        except WaveError as exc:
+            result.errors.append("fault request: %s" % scrub(exc, 300))
+    if fault_spec is not None and not fault_spec.per_appliance:
+        ok, payload = _try(result.errors, "fault request", lambda: api.call(fault_spec))
+        result.account_faults, result.account_faults_fetched = payload, ok
+    for data in prepared:
+        ctx = {"mac": data.mac, "serial": data.serial, "name": data.name}
         if cfg.status_request is not None:
             spec = cfg.status_request
             data.status_fetched, data.status = _try(data.errors, "status", lambda: api.call(spec, ctx))
@@ -708,8 +727,11 @@ def apply_cycle(conn: sqlite3.Connection, cfg: Config, fetched: FetchResult, *, 
             if not lines:
                 continue
             body = "bwwatch is now monitoring %s.\n%s" % (names.get(mac, mac), "\n".join(lines))
-            if cfg.fault_request is None and mac != ACCOUNT:
-                body += "\nNote: BW_FAULT_REQUEST is not set, so the fault/notification history is NOT being read yet."
+            if cfg.fault_request is None and not a.faults_fetched and mac != ACCOUNT:
+                body += (
+                    "\nNote: BW_FAULT_REQUEST is not set, so the fault/notification history is NOT being read yet. "
+                    "bwwatch tries GET /wave/getApplianceErrors on its own (./bwctl discover)."
+                )
             enqueue(conn, kind="info", title="Watching %s" % names.get(mac, mac), body=body, priority=3, now=now)
         _queue_fault_alerts(conn, cfg, new_faults, now)
         outcome.new_faults = new_faults

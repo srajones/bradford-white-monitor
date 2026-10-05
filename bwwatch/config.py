@@ -235,6 +235,9 @@ class Config:
     log_fields: bool = True  # keep a history of every field in the list/status/... answers
     watch_fields: Optional["re.Pattern[str]"] = None  # alert when a field whose name matches this changes
     keep_days: int = 365  # how long field and request history is kept (0 = forever)
+    # While a Notifications entry is active, poll this often, but only for fault_poll_hours after it was first seen.
+    fault_poll_interval: int = 600
+    fault_poll_hours: int = 12
 
     @property
     def token_url(self) -> str:
@@ -516,4 +519,6 @@ def _build(env: Mapping[str, str]) -> Config:
         log_fields=_bool(env, "BW_LOG_FIELDS", True),
         watch_fields=_regex(env, "BW_WATCH_FIELDS"),
         keep_days=_int(env, "BW_KEEP_HISTORY_DAYS", 365, 0, 3650),
+        fault_poll_interval=_int(env, "BW_FAULT_POLL_INTERVAL_SECONDS", 600, MIN_POLL_SECONDS, 86400),
+        fault_poll_hours=_int(env, "BW_FAULT_POLL_HOURS", 12, 1, 24 * 14),
     )

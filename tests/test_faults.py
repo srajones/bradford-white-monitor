@@ -52,6 +52,22 @@ class FindList(unittest.TestCase):
         self.assertEqual(events[0].occurred_at, "2026-10-04T18:15:00Z")
         self.assertEqual(extract_events({"error_history": [], "message": "Success"}, OPTS)[0], [], "an empty history is 'no faults'")
 
+    def test_active_errors_marks_the_current_fault_active(self):
+        """`active_errors` is the app's name for the fault that is happening now (libapp.so)."""
+        payload = {
+            "error_history": [
+                {"error_code": 10, "error_string": "(Cleared) Superheat Fault", "timestamp": "2026-10-04T18:15:00Z"},
+                {"error_code": 3, "error_string": "Upper Thermistor Fault", "timestamp": "2026-10-04T19:00:00Z"},
+            ],
+            "active_errors": [
+                {"error_code": 3, "error_string": "Upper Thermistor Fault", "timestamp": "2026-10-04T19:00:00Z"},
+            ],
+        }
+        events, where = extract_events(payload, OPTS)
+        self.assertEqual(where, "error_history")
+        by_code = {e.code: e.state for e in events}
+        self.assertEqual(by_code, {"10": "cleared", "3": "active"})
+
     def test_empty_list_is_recognised_as_no_faults(self):
         self.assertEqual(find_event_list({"notifications": []})[0], [])
         self.assertEqual(find_event_list([])[0], [])

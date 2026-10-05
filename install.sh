@@ -584,8 +584,8 @@ finish() {
   say "Outside it there is only Docker's own storage: the image $IMAGE and the container $CONTAINER."
   if [ "${FAULT_UNSET:-0}" = 1 ]; then
     say
-    warn "One thing is still open: the Notifications request (where \"Fault 10\" appears) is not set."
-    hint "Until you add it, bwwatch tells you about settings changes and fault-like status flags only."
+    warn "One thing is still open: the Notifications request (where \"Fault 10\" appears) is not set in .env."
+    hint "bwwatch tries GET /wave/getApplianceErrors by itself and remembers the form that works."
     hint "README, section \"Finding the fault request\"; then  ./install.sh --reconfigure"
   fi
   say

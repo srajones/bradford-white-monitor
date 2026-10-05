@@ -295,6 +295,10 @@ def meta_set(conn: sqlite3.Connection, key: str, value: object) -> None:
     )
 
 
+def meta_delete(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+
 # --- integrity --------------------------------------------------------------
 def integrity_check(conn: sqlite3.Connection, quick: bool = False) -> List[str]:
     """Empty list if the database is healthy, otherwise SQLite's complaints."""

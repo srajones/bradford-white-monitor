@@ -148,6 +148,43 @@ def cmd_changes(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_calls(cfg: Config, args: argparse.Namespace) -> int:
+    """What was asked of the cloud: requests per endpoint in the window, status codes, speed, and any 429s."""
+    conn = open_db(cfg)
+    if conn is None:
+        print("No database yet - has the service run?")
+        return 1
+    try:
+        since = iso(datetime.now(timezone.utc) - timedelta(hours=args.hours)) if args.hours > 0 else "0000"
+        rows = conn.execute(
+            """SELECT endpoint,
+                      COUNT(*) AS n,
+                      SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END) AS limited,
+                      SUM(CASE WHEN status IS NULL OR status >= 400 THEN 1 ELSE 0 END) AS failed,
+                      ROUND(AVG(ms)) AS avg_ms,
+                      MIN(status) AS lo,
+                      MAX(status) AS hi
+               FROM api_calls WHERE taken_at >= ? GROUP BY endpoint ORDER BY n DESC""",
+            (since,),
+        ).fetchall()
+        if not rows:
+            print("No requests logged in that time.")
+            return 0
+        window = "the last %g h" % args.hours if args.hours > 0 else "everything logged"
+        print("Requests, %s:" % window)
+        print(table(
+            ("ENDPOINT", "COUNT", "FAILED", "429s", "AVG MS", "STATUS"),
+            [(r["endpoint"], r["n"], r["failed"], r["limited"], int(r["avg_ms"] or 0),
+              "%s-%s" % (r["lo"] if r["lo"] is not None else "-", r["hi"] if r["hi"] is not None else "-")) for r in rows],
+        ))
+        total = sum(r["n"] for r in rows)
+        limited = sum(r["limited"] for r in rows)
+        print("\n%d request(s).%s" % (total, "  The cloud asked us to slow down (HTTP 429)." if limited else ""))
+    finally:
+        conn.close()
+    return 0
+
+
 def add_arguments(sub: Any) -> None:
     """The sub-commands this module provides (called by cli.build_parser)."""
     p = sub.add_parser("fields", help="list every field the cloud reports, with its current value and change count")
@@ -159,4 +196,6 @@ def add_arguments(sub: Any) -> None:
     p.add_argument("--minutes", type=int, default=180, help="with --around: how many minutes either side (default 180)")
     p.add_argument("--limit", type=int, default=200, help="show at most this many, the latest (0 = all; default 200)")
     p.add_argument("--all", action="store_true", help="include each source's starting picture (the first values seen)")
+    p = sub.add_parser("calls", help="the request log: how many calls, how fast, and any HTTP 429 slow-downs")
+    p.add_argument("--hours", type=float, default=24.0, help="how far back to look (0 = everything; default 24)")
 

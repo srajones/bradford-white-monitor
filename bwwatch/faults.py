@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from .config import FaultOptions
@@ -46,6 +46,9 @@ PREFERRED_LIST_KEYS = (
     "notifications", "notificationlist", "alerts",
     "alarms", "events", "history", "items", "records", "results", "messages", "data",
 )
+# The app also has ApplianceActiveError / `active_errors`: the fault that is happening right now,
+# separate from the history list. Entries found only there are treated as active.
+ACTIVE_LIST_KEYS = ("activeerrors", "activeerror", "applianceactiveerrors", "applianceactiveerror")
 
 
 def _dig(payload: Any, path: str) -> Any:
@@ -319,22 +322,63 @@ def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
                       state, cleared_at)
 
 
+def _named_lists(payload: Any, depth: int = 0) -> List[Tuple[str, list]]:
+    found: List[Tuple[str, list]] = []
+    if isinstance(payload, dict) and depth <= 2:
+        for key, value in payload.items():
+            if isinstance(value, list):
+                found.append((str(key), value))
+            elif isinstance(value, dict):
+                for sub, items in _named_lists(value, depth + 1):
+                    found.append(("%s.%s" % (key, sub), items))
+    return found
+
+
+def _is_active_key(path: str) -> bool:
+    return norm_key(path.split(".")[-1]) in ACTIVE_LIST_KEYS
+
+
 def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[FaultEvent]], str]:
-    """Entries found in a fault response, or ``(None, why)`` if it has no recognisable list."""
+    """Entries found in a fault response, or ``(None, why)`` if it has no recognisable list.
+
+    A history list (``error_history`` and the usual names) is read first. ``active_errors`` — the
+    app's name for the fault that is active right now — is merged in and marked active when the
+    entry itself does not already say.
+    """
     items, where = find_event_list(payload, opts.list_path)
-    if items is None:
+    active: List[Tuple[str, list]] = []
+    if not opts.list_path:
+        active = [(key, lst) for key, lst in _named_lists(payload) if _is_active_key(key) and key != where]
+    if items is None and not active:
         return None, where
-    events: List[FaultEvent] = []
-    seen = set()
-    for item in items:
+
+    by_fp: Dict[str, FaultEvent] = {}
+    order: List[str] = []
+
+    def add(item: Any, force_active: bool) -> None:
         if opts.match is not None and not opts.match.search(json.dumps(item, default=str, ensure_ascii=False)):
-            continue
+            return
         event = normalize_event(item, opts)
-        if event.fingerprint in seen:
-            continue
-        seen.add(event.fingerprint)
-        events.append(event)
-    return events, where
+        if force_active and event.state != "cleared":
+            # The active list is the app's "happening now". A "(Cleared)" marker still wins: the text is explicit.
+            if event.state != "active":
+                event = replace(event, state="active")
+        prev = by_fp.get(event.fingerprint)
+        if prev is None:
+            by_fp[event.fingerprint] = event
+            order.append(event.fingerprint)
+        elif event.state == "active" and prev.state != "cleared":
+            by_fp[event.fingerprint] = replace(prev, state="active", cleared_at=None)
+        elif event.state == "active" and prev.state is None:
+            by_fp[event.fingerprint] = replace(prev, state="active")
+
+    if items is not None:
+        for item in items:
+            add(item, _is_active_key(where))
+    for _key, lst in active:
+        for item in lst:
+            add(item, True)
+    return [by_fp[fp] for fp in order], where or (active[0][0] if active else where)
 
 
 # --- fault flags inside status payloads -------------------------------------

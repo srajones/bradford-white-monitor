@@ -15,7 +15,8 @@ notifications for faults.
   see [Everything stays in `/opt/bwheater`](#everything-stays-in-optbwheater).
 - **Light — and no browser.** Plain Python talking to an API: no headless browser, no extra packages, about
   20–35 MB of RAM — see [Is it lightweight?](#is-it-lightweight-does-it-run-a-browser).
-- **Gentle.** About 4 small requests per hour, never more often than every 5 minutes —
+- **Gentle.** About 4 small requests per hour normally, never more often than every 5 minutes.
+  While a fault is active it checks about every 10 minutes, for up to 12 hours —
   see [How often it contacts Bradford White](#how-often-it-contacts-bradford-white).
 - **Hard to corrupt.** SQLite in WAL mode with full fsync, one transaction per poll, integrity checks,
   verified backups, automatic recovery — see [Your data](#your-data-and-how-it-is-protected).
@@ -23,10 +24,10 @@ notifications for faults.
   "no faults".
 - **No password on the server.** You sign in once in your own browser; only a revocable token is kept.
 
-> **One thing is still yours to find:** the exact request the app's *Notifications* tab uses is not
-> publicly documented. Until you set it (see [Finding the fault request](#finding-the-fault-request)),
-> bwwatch records the heater's settings and watches the status data for fault-looking fields, but it can't
-> read the notification list. Everything else works from day one.
+> **Notifications.** The Wave app reads that list with `GET /wave/getApplianceErrors`. bwwatch tries the
+> likely forms of that request by itself and remembers the one that works (see
+> [Finding the fault request](#finding-the-fault-request)). Until one answers, it still records settings
+> and watches the status data for fault-looking fields.
 
 ---
 
@@ -201,57 +202,34 @@ it back. The code in it works once and expires within minutes. Edited `.env`? `d
 
 ## Finding the fault request
 
-The Notifications tab in the app (titled with your heater's name, listing entries such as *"Fault 10 —
-(Cleared) Superheat Fault — October 04, 2026 at 01:15 PM"*) loads its list with a request that nobody has
-published. You need its path (and parameters) once; you know you have the right one when its answer lists
-your faults. The known calls look like this, so the missing one probably does too:
+The Notifications tab (entries such as *"Fault 10 — (Cleared) Superheat Fault"*) is
+`GET /wave/getApplianceErrors`. That path is plain text in Wave app 1.1.3371 (`libapp.so`), next to
+`error_history`, `error_code`, `error_string`, `timestamp` and a separate `active_errors` list for the
+fault that is active right now. The app does not say which query parameter it sends, so bwwatch tries
+these three, read-only, 3 seconds apart, at most once a day, until one returns JSON. It remembers that
+form. An explicit `BW_FAULT_REQUEST` always wins. `./bwctl discover` shows the result;
+`./bwctl discover --reset` forgets it.
 
 ```
-GET /wave/getApplianceList?username=<your account id>
-GET /wave/getApplianceStatus?macAddress=<heater MAC>
+GET /wave/getApplianceErrors?macAddress={mac}
+GET /wave/getApplianceErrors?mac_address={mac}
+GET /wave/getApplianceErrors?macAddress={mac}&serialNumber={serial}
 ```
 
-**Option A — read it out of the app (no traffic capture needed).** The Wave app is built with Flutter
-(the community client identifies itself as `Dart/3.8`). Flutter apps ignore a phone's proxy settings and
-don't trust user-installed certificates, so ordinary capture apps usually show nothing useful. But Flutter
-keeps API paths as plain text in the app's `libapp.so`:
-
-```bash
-adb shell pm list packages | grep -i -E 'bradford|wave'     # find the package name
-adb shell pm path <package>                                  # then `adb pull` each path it prints
-unzip -p base.apk lib/arm64-v8a/libapp.so > libapp.so        # (the split that contains lib/)
-strings -n 6 libapp.so | grep -i -E '/wave/|get[A-Za-z]*(Notif|Fault|Alert|Alarm|Event|History)'
-```
-
-You're looking for another `get…` name next to `getApplianceList` / `getApplianceStatus`, such as
-`getNotifications`. (This is a general technique; it may not work on every build.)
-
-**Option B — capture the app's traffic** on a rooted phone or an emulator, using a tool that can bypass
-Flutter's certificate handling (e.g. reFlutter or a Frida script). Heavier, but shows the exact request.
-
-**Option C — let bwwatch guess.** The guided setup offers it, or run `./bwctl probe --yes`: about 14 read-only
-`GET`s (guessed names such as `getNotifications`, `getFaultHistory`, 3 seconds apart, once) are sent and any that exist
-are reported. It only ever sends `get…` requests that pass the read-only guard. It may find nothing.
-
-**Then test and set it.** Easiest: `./install.sh --reconfigure` and choose "I have it" at step 5 — it runs the request
-for real and shows the entries it found. By hand:
-
-```bash
-./bwctl call "GET /wave/getNotifications?username={account_id}&macAddress={mac}"
-```
-
-When the answer is your notification list, put the same text in `.env`:
+You can also set it yourself. `./bwctl call` runs one of those lines and prints the JSON. Put the line
+that works in `.env` (single quotes, because of `{` and `&`):
 
 ```
-BW_FAULT_REQUEST='GET /wave/getNotifications?username={account_id}&macAddress={mac}'
+BW_FAULT_REQUEST='GET /wave/getApplianceErrors?macAddress={mac}'
 ```
 
-(Single quotes, because the value contains `&`, `{` and spaces; the setup writes them for you.) Placeholders:
-`{account_id}` `{mac}` `{serial}` `{name}`. For a `POST`, add a JSON body:
-`BW_FAULT_REQUEST='POST /wave/getNotifications {"mac_address": "{mac}"}'`. Then run `./bwctl check` — it should list
-the existing entries — and `./bwctl restart`.
+Placeholders: `{account_id}` `{mac}` `{serial}` `{name}`. Then `./bwctl restart`. Existing entries are
+recorded as *pre-existing* without alerting. Anything **active**, and anything new after that, alerts.
 
-On the first poll after you set it, existing entries are recorded as *pre-existing* without alerting
+**Optional.** `./bwctl probe --yes` still sends about 14 read-only guesses if Wave renames the path.
+`./bwctl discover --now` retries the three forms immediately.
+
+On the first poll after the request is known, existing entries are recorded as *pre-existing* without alerting
 (one summary message tells you the most recent ones). Only entries that appear after that raise an alert.
 If the notification list also holds non-fault messages, narrow it with `BW_FAULT_MATCH` (a regular
 expression). If `check` says it can't recognise the response format, set `BW_FAULT_LIST_PATH` (and, if
@@ -502,6 +480,8 @@ running container, or a one-off one if the service is stopped.
 | `faults [--limit N] [--all] [--raw]` | the logged faults, newest first: when it happened, code, whether it is active or cleared, when it cleared |
 | `fields [--match PATTERN]` | every field the cloud reports, its value now, how often it changed and when |
 | `changes [--hours N] [--match PATTERN] [--around "2026-10-04 13:15" [--minutes N]]` | what changed and when — most useful around the time of a fault |
+| `calls [--hours N]` | the request log: how many calls to each endpoint, how fast, and any HTTP 429 slow-downs |
+| `discover [--now] [--reset]` | the remembered `getApplianceErrors` form; `--now` tries the three forms, `--reset` forgets it |
 | `export faults\|polls\|readings [--out FILE]` | CSV, e.g. for a warranty claim: `./bwctl export faults > faults.csv` |
 | `check` | read everything once and show what bwwatch understands (writes nothing) |
 | `login` | sign in again (needed if you get the *"sign-in needs attention"* alert) |
@@ -517,6 +497,7 @@ running container, or a one-off one if the service is stopped.
 
 Under the hood these are the container's own commands — `docker compose exec bwwatch bwwatch <command>` — which are:
 `run`, `login`, `check`, `call`, `probe`, `status`, `faults`, `export`, `backup`, `dbcheck`, `test-notify`, `verify`,
+`fields`, `changes`, `calls`, `discover`,
 `setup` (the guided setup wizard; `install.sh` runs it for you), `healthcheck` (exit 0 if the service is alive; Docker
 uses it) and `version`.
 

@@ -204,8 +204,9 @@ def _evaluate(cfg: Config, snap: Dict[str, Any], since: Optional[float] = None, 
     if cfg.fault_request is not None:
         checks.append(Check(OK, "Fault history", "reading %s" % cfg.fault_request.describe()))
     else:
-        checks.append(Check(WARN, "Fault history", "not configured: only settings and status flags are watched",
-                            "Add the Notifications request - README, 'Finding the fault request'"))
+        checks.append(Check(WARN, "Fault history",
+                            "BW_FAULT_REQUEST is not set; bwwatch tries GET /wave/getApplianceErrors on its own",
+                            "See README, 'Finding the fault request'"))
 
     if not snap.get("db"):
         checks.append(Check(FAIL, "Database", "not created yet"))

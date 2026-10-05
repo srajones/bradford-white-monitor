@@ -1,8 +1,19 @@
 # What is left to do
 
-Written 2026-10-05, after the first real look inside the Wave app. Start with section 1: it needs you, not code.
+Updated 2026-10-05 after the Notifications path was read out of Wave 1.1.3371 and bwwatch was taught to use it.
 
 ## 0. Where things stand
+
+**Working and pushed:** everything in the previous note, plus:
+
+- **Auto-learn.** With `BW_FAULT_REQUEST` unset, bwwatch tries the three forms of `GET /wave/getApplianceErrors` (at most once a day, 3 seconds apart, read-only), remembers the first that returns JSON (`meta` key `learned.fault_request`), and sends an info alert. `./bwctl discover` shows it; `./bwctl discover --reset` forgets it; `./bwctl discover --now` tries immediately. An explicit `BW_FAULT_REQUEST` always wins.
+- **`active_errors`.** The app's name for the fault that is active right now is merged with `error_history` and marked active when the entry itself does not say. A "(Cleared)" marker in the text still wins.
+- **Faster polling while a fault entry is active.** `BW_FAULT_POLL_INTERVAL_SECONDS` (default 600, floor 300) for `BW_FAULT_POLL_HOURS` (default 12) after that entry was first seen.
+- **`./bwctl calls`** and a "Requests, last 24h" line in `status`.
+
+**Still needs you, once, on the VPS:** pull this version (`git pull && ./bwctl update`) and let it try the three forms against your real account. Paste the JSON (MAC blanked) if you can, from `./bwctl call` or from the first poll. The exact place the "(Cleared)" flag lives in that JSON is still a guess until a real sample arrives.
+
+## 2. Still to build, in priority order
 
 **Working and pushed:** the guided installer (`/opt/bwheater`, nothing outside it), the setup wizard, hourly polling with a
 5-minute floor, alerts (ntfy / Telegram / email / webhook / Home Assistant), the crash-proof SQLite log with daily

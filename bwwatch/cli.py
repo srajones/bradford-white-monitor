@@ -18,10 +18,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
-from . import __version__
+from . import __version__, views
 from .config import Config, ConfigError, RequestSpec
-from .cycle import describe_event, fetch
-from .db import DB_NAME, DatabaseTooNew, backup_now, connect, init_schema, integrity_check, list_backups, table_counts
+from .cycle import describe_event, enqueue, fetch
+from .db import DB_NAME, DatabaseTooNew, backup_now, connect, init_schema, integrity_check, list_backups, open_database, table_counts, tx
+from .discover import CANDIDATES, forget, load, try_candidates
 from .errors import AuthError, WaveError
 from .faults import extract_events
 from .notify import Notifier, test_message
@@ -31,7 +32,6 @@ from .readings import extract_reading, reading_from_row
 from .service import Service, healthcheck
 from .util import iso, local_time, truncate
 from .verify import format_checks, overall_ok, run_checks
-from . import views
 from .wave import TokenManager, TokenStore, WaveApi, parse_redirect
 
 log = logging.getLogger("bwwatch")
@@ -215,8 +215,9 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
         print("\n  Account-level fault history:")
         problems += _print_fault_check(cfg, fetched.account_faults, "    ")
     if cfg.fault_request is None:
-        print("\nFault history:  NOT CONFIGURED. Without it bwwatch can only see settings changes and fault-like")
-        print("                fields in the status data. See README 'Finding the fault request'.")
+        print("\nFault history:  NOT CONFIGURED in .env. bwwatch tries GET /wave/getApplianceErrors on its own.")
+        print("                Until that answers, only settings changes and fault-like status fields are watched.")
+        print("                See README 'Finding the fault request'.")
     errors = fetched.all_errors()
     for err in errors:
         print("\nERROR: %s" % err)
@@ -300,7 +301,7 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
     print("Service:         %s" % (("running - " + message) if ok else ("NOT running / unhealthy - " + message)))
     print("Poll interval:   every %d minutes" % (cfg.interval // 60))
     print("Alert channels:  %s" % (", ".join(cfg.channel_names) or "NONE"))
-    print("Fault history:   %s" % (cfg.fault_request.describe() if cfg.fault_request else "NOT configured (see README)"))
+    print("Fault history:   %s" % (cfg.fault_request.describe() if cfg.fault_request else "NOT configured in .env (bwwatch can learn it; ./bwctl discover)"))
     conn = _open_existing_db(cfg)
     if conn is None:
         print("Database:        none yet")
@@ -312,6 +313,11 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
         since = iso(datetime.now(timezone.utc) - timedelta(hours=24))
         day = conn.execute("SELECT COALESCE(SUM(ok), 0), COUNT(*) FROM polls WHERE started_at >= ?", (since,)).fetchone()
         print("Polls, last 24h: %d ok of %d" % (day[0], day[1]))
+        calls = conn.execute("SELECT COUNT(*) FROM api_calls WHERE taken_at >= ?", (since,)).fetchone()[0]
+        print("Requests, last 24h: %d  (./bwctl calls)" % calls)
+        learned = load(conn)
+        if cfg.fault_request is None and learned is not None:
+            print("Learned request: %s" % learned.describe())
         print("\nHeaters:")
         for row in conn.execute("SELECT * FROM appliances ORDER BY name"):
             reading = conn.execute("SELECT * FROM readings WHERE mac = ? ORDER BY id DESC LIMIT 1", (row["mac"],)).fetchone()
@@ -508,6 +514,72 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return wizard.Wizard(wizard.Console(), os.environ, data_dir, template).run()
 
 
+def cmd_discover(cfg: Config, args: argparse.Namespace) -> int:
+    """Show, forget, or force another try of the three /wave/getApplianceErrors forms."""
+    conn, _recovery = open_database(cfg.data_dir)
+    try:
+        if getattr(args, "reset", False):
+            forget(conn)
+            print("Forgotten. The next poll tries the three forms of /wave/getApplianceErrors again.")
+            return 0
+        if getattr(args, "now", False):
+            if cfg.fault_request is not None:
+                print("BW_FAULT_REQUEST is set, so it is used and nothing is guessed:")
+                print("  %s" % cfg.fault_request.describe())
+                return 0
+            _store, tokens, api = _make_api(cfg)
+            if not tokens.has_credentials():
+                print("Not signed in. Run:  ./bwctl login")
+                return 1
+            try:
+                items = api.list_appliances()
+            except WaveError as exc:
+                print("error: %s" % exc, file=sys.stderr)
+                return 1
+            if not items:
+                print("This account has no water heaters.")
+                return 1
+            item = items[0]
+            appliance = type("Heater", (), {
+                "mac": str(item.get("macAddress") or ""),
+                "serial": str(item.get("serialNumber") or ""),
+                "name": str(item.get("friendlyName") or ""),
+            })()
+            try:
+                spec = try_candidates(api, appliance, conn, force=True, gap=3.0)
+            except WaveError as exc:
+                print("error: %s" % exc, file=sys.stderr)
+                return 1
+            if spec is None:
+                print("None of the three forms returned JSON. Tried again in a day, or after ./bwctl discover --reset.")
+            else:
+                with tx(conn):
+                    enqueue(
+                        conn, kind="info", title="Notifications list found",
+                        body="bwwatch will read fault history with:\n%s" % spec.describe(),
+                        priority=3, now=iso(),
+                    )
+                print("Remembered: %s" % spec.describe())
+        learned = load(conn)
+        print("Learned request: %s" % (learned.describe() if learned else "not yet"))
+        if cfg.fault_request is not None:
+            print("BW_FAULT_REQUEST is set and wins: %s" % cfg.fault_request.describe())
+        rows = conn.execute("SELECT tried_at, target, verdict, note FROM discovery ORDER BY id").fetchall()
+        if not rows:
+            print("No attempts yet. With BW_FAULT_REQUEST unset, the service tries these on its own:")
+            for text in CANDIDATES:
+                print("  %s" % text)
+            return 0
+        print("\nAttempts:")
+        for row in rows:
+            print("  %s  %s %-12s %s" % (local_time(row["tried_at"], cfg.display_tz), row["verdict"], "", row["target"]))
+            if row["note"]:
+                print("      %s" % row["note"])
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_healthcheck(cfg: Config, args: argparse.Namespace) -> int:
     ok, message = healthcheck(cfg.data_dir)
     print(message)
@@ -530,6 +602,8 @@ COMMANDS: Dict[str, Callable[[Config, argparse.Namespace], int]] = {
     "verify": cmd_verify,
     "fields": views.cmd_fields,
     "changes": views.cmd_changes,
+    "calls": views.cmd_calls,
+    "discover": cmd_discover,
     "healthcheck": cmd_healthcheck,
 }
 # `setup` and `version` take no loaded configuration, so they are handled before COMMANDS.
@@ -574,6 +648,9 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--verify", action="store_true", help="check the installed .env reached the service exactly as chosen")
     group.add_argument("--cleanup", action="store_true", help="remove the wizard's temporary output files")
     views.add_arguments(sub)
+    p = sub.add_parser("discover", help="show or retry the search for /wave/getApplianceErrors")
+    p.add_argument("--reset", action="store_true", help="forget the remembered form; the next poll tries again")
+    p.add_argument("--now", action="store_true", help="try the three forms immediately (read-only, 3 seconds apart)")
     sub.add_parser("healthcheck", help="exit 0 if the service is alive (used by Docker)")
     sub.add_parser("version", help="print the version")
     return parser

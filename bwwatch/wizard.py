@@ -665,9 +665,9 @@ class Wizard:
             if self.c.confirm("Keep it?", True):
                 self.values["BW_FAULT_REQUEST"] = current
                 return
-        self.c.say("bwwatch can already see your heater's mode and setpoint. To also read the app's")
-        self.c.say("Notifications list it needs the name of one request that Bradford White has not")
-        self.c.say("published. You can add it now or later (README: \"Finding the fault request\").")
+        self.c.say("The Wave app reads that list with GET /wave/getApplianceErrors. If you leave this")
+        self.c.say("blank, bwwatch tries the likely forms by itself and remembers the one that works.")
+        self.c.say("Paste a request only if that fails (README: \"Finding the fault request\").")
         options = [
             ("have", "I have it (or want to try a guess)"),
             ("probe", "Try to find it for me (about %d read-only guesses, once)" % REQUEST_COUNT),
@@ -679,8 +679,7 @@ class Wizard:
         elif choice == "probe":
             self._probe_for_request()
         else:
-            self.c.say("Skipped. Alerts for faults in the Notifications list will start once it is set.", "warn")
-            self.c.say("Until then you are alerted to settings changes and fault-like status fields.")
+            self.c.say("Skipped. bwwatch will try GET /wave/getApplianceErrors on its own.", "warn")
 
     def _test_request(self, text: str) -> Optional[bool]:
         """Run a candidate request for real. True = looks right, False = rejected/failed, None = unsure."""
