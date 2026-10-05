@@ -5,6 +5,8 @@
 token.json
 *.pem
 *.key
+automation.yaml
+automation.yml
 
 # --- Runtime data: SQLite DB, WAL/SHM sidecars, backups, token store -------
 data/
