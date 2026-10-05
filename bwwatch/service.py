@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-from . import __version__
+from . import __version__, observe
 from .config import MIN_POLL_SECONDS, Config
 from .cycle import FetchResult, Outcome, apply_cycle, deliver_outbox, enqueue, fetch
 from .db import (
@@ -179,6 +179,8 @@ class Service:
         self.write_status()
         self.api.retry_after = 0.0
         self.tokens.retry_after = 0.0
+        self.api.calls.clear()
+        self.tokens.calls.clear()
         if self._auth_cooldown_active():
             log.warning("sign-in was rejected earlier; not contacting the sign-in server until a new `login` (or the 6-hour retry)")
             fetched = FetchResult(
@@ -203,6 +205,7 @@ class Service:
             except Exception as exc:  # noqa: BLE001 - a bug while fetching must not stop the monitor
                 log.exception("unexpected error while fetching")
                 fetched = FetchResult(started_at=started, errors=["internal error: %s: %s" % (type(exc).__name__, scrub(exc, 200))])
+        fetched.calls = sorted(self.tokens.calls + self.api.calls, key=lambda call: call.at)
         outcome = self._record(fetched)
         if outcome.ok:
             self.failures = 0
@@ -308,6 +311,12 @@ class Service:
                 if problems:
                     self.recover_database("integrity_check: " + "; ".join(problems[:2]))
                     return
+            if hours_since(meta_get(conn, "maint.prune_at")) >= 24:
+                with tx(conn):
+                    removed = observe.prune(conn, self.cfg.keep_days, iso())
+                    meta_set(conn, "maint.prune_at", iso())
+                if removed:
+                    log.info("forgot %d old history row(s) (older than %d days)", removed, self.cfg.keep_days)
             if hours_since(meta_get(conn, "maint.backup_at")) >= self.cfg.backup_every_hours:
                 path = backup_now(conn, self.cfg.data_dir / "backups", self.cfg.backup_keep)
                 meta_set(conn, "maint.backup_at", iso())

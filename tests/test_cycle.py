@@ -259,6 +259,102 @@ class ClearedFaults(CycleCase):
             self.assertIn(column, header)
 
 
+class FieldLog(CycleCase):
+    """Everything the cloud reports is kept, field by field, changes only."""
+
+    def obs(self, **where):
+        rows = self.svc.conn.execute("SELECT * FROM observations ORDER BY id").fetchall()
+        return [r for r in rows if all(r[k] == v for k, v in where.items())]
+
+    def test_the_first_poll_logs_every_field_of_the_list_and_the_status(self):
+        self.poll()
+        paths = {(r["source"], r["path"]) for r in self.obs()}
+        for expected in (("list", "friendlyName"), ("list", "applianceType"), ("status", "setpointFahrenheit"),
+                         ("status", "mode"), ("status", "heatModeValue")):
+            self.assertIn(expected, paths)
+        self.assertNotIn(("status", "requestId"), paths, "a field that changes on every call is not news")
+        self.assertTrue(all(r["event"] == "start" for r in self.obs()), "the starting values are not 'changes'")
+        self.assertIn("Logging every field of the status answer", self.delivered()[0]["message"])
+
+    def test_a_poll_where_nothing_changed_adds_nothing(self):
+        self.poll()
+        before = self.count("observations")
+        out = self.poll()
+        self.assertEqual(self.count("observations"), before)
+        self.assertEqual(out.field_changes, 0)
+
+    def test_a_change_in_any_field_is_logged_with_old_and_new(self):
+        self.poll()
+        self.mock.status[MAC].update({"compressorState": "off", "setpointFahrenheit": 125})
+        out = self.poll()
+        by_path = {r["path"]: r for r in self.obs(source="status") if r["event"] != "new" or r["path"] == "compressorState"}
+        self.assertEqual((by_path["setpointFahrenheit"]["old_value"], by_path["setpointFahrenheit"]["new_value"]), ("120", "125"))
+        self.assertEqual(by_path["compressorState"]["event"], "new")
+        self.assertEqual(out.field_changes, 2)
+        self.mock.status[MAC]["compressorState"] = "on"
+        self.poll()
+        self.assertEqual([(r["old_value"], r["new_value"]) for r in self.obs(path="compressorState", event="changed")], [("off", "on")])
+
+    def test_a_field_that_disappears_and_returns_is_logged(self):
+        self.mock.status[MAC]["errorState"] = "none"
+        self.poll()
+        del self.mock.status[MAC]["errorState"]
+        self.poll()
+        self.assertEqual([r["event"] for r in self.obs(path="errorState")], ["start", "gone"])
+        self.mock.status[MAC]["errorState"] = "overheat"
+        self.poll()
+        self.assertEqual([r["event"] for r in self.obs(path="errorState")], ["start", "gone", "back"])
+
+    def test_the_fault_history_contributes_only_its_plain_fields(self):
+        self.mock.notifications = {"count": 1, "notifications": [event(1)]}
+        self.poll()
+        paths = {r["path"] for r in self.obs(source="faults")}
+        self.assertEqual(paths, {"count"}, "its entries are in the faults table; indexes into a growing list would only churn")
+
+    def test_it_can_be_switched_off(self):
+        self.svc = self.service(self.cfg(BW_LOG_FIELDS="false"))
+        self.poll()
+        self.assertEqual(self.count("observations"), 0)
+        self.assertEqual(self.count("field_state"), 0)
+        self.assertGreater(self.count("snapshots"), 0, "the raw answers are still kept")
+
+    def test_watched_fields_alert_only_when_they_change_after_the_start(self):
+        self.svc = self.service(self.cfg(BW_WATCH_FIELDS=r"status\.(compressor|error)"))
+        self.mock.status[MAC]["compressorState"] = "off"
+        self.poll()
+        self.assertEqual(self.kinds(), ["info"], "the starting values are not news")
+        def field_alerts():
+            return [m for m in self.delivered() if m["title"] == "Wave field changed — Basement"]
+
+        self.mock.status[MAC].update({"compressorState": "on", "setpointFahrenheit": 130})
+        self.poll()
+        (alert,) = field_alerts()
+        self.assertIn("status.compressorState: off -> on", alert["message"])
+        self.assertNotIn("setpointFahrenheit", alert["message"], "only the fields you asked about")
+        self.mock.status[MAC]["errorState"] = "overheat"
+        self.poll()
+        self.assertIn("status.errorState: (not there) -> overheat", field_alerts()[-1]["message"])
+        self.assertIn("[new]", field_alerts()[-1]["message"])
+        sent = len(field_alerts())
+        self.poll()
+        self.assertEqual(len(field_alerts()), sent, "and only once")
+
+    def test_watching_nothing_is_the_default(self):
+        self.poll()
+        self.mock.status[MAC].update({"compressorState": "on", "faultish": "x"})
+        self.poll()
+        self.assertNotIn("setting", self.kinds())
+
+    def test_a_bug_in_field_logging_cannot_lose_the_rest_of_the_poll(self):
+        self.poll()
+        with mock.patch("bwwatch.observe.record", side_effect=ValueError("surprise")):
+            out = self.poll()
+        self.assertFalse(out.ok)
+        self.assertIn("logging every field", out.error)
+        self.assertEqual(self.count("readings"), 2, "the settings were still recorded")
+        self.assertEqual(self.count("polls"), 2)
+
+
 class Baseline(CycleCase):
     def test_first_poll_records_existing_faults_without_alarming(self):
         self.mock.notifications = {"notifications": [event(1), event(2, code=11)]}

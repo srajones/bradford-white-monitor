@@ -500,6 +500,8 @@ running container, or a one-off one if the service is stopped.
 |-------------|--------------|
 | `status` | one-screen summary: service health, last poll, heater settings, faults, pending alerts, backups |
 | `faults [--limit N] [--all] [--raw]` | the logged faults, newest first: when it happened, code, whether it is active or cleared, when it cleared |
+| `fields [--match PATTERN]` | every field the cloud reports, its value now, how often it changed and when |
+| `changes [--hours N] [--match PATTERN] [--around "2026-10-04 13:15" [--minutes N]]` | what changed and when — most useful around the time of a fault |
 | `export faults\|polls\|readings [--out FILE]` | CSV, e.g. for a warranty claim: `./bwctl export faults > faults.csv` |
 | `check` | read everything once and show what bwwatch understands (writes nothing) |
 | `login` | sign in again (needed if you get the *"sign-in needs attention"* alert) |

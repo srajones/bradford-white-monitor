@@ -14,6 +14,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import observe
 from .config import Config
 from .db import meta_get, meta_set, savepoint, tx
 from .errors import AuthError, WaveError
@@ -21,7 +22,7 @@ from .faults import FaultEvent, digest, extract_events, scan_state
 from .notify import Message, Notifier
 from .readings import extract_reading, reading_changes, reading_from_row
 from .util import hours_since, iso, local_time, parse_iso, scrub, truncate
-from .wave import WaveApi
+from .wave import CallRecord, WaveApi
 
 log = logging.getLogger("bwwatch.cycle")
 
@@ -51,6 +52,7 @@ class ApplianceData:
     faults: Any = None
     faults_fetched: bool = False
     errors: List[str] = field(default_factory=list)
+    extras: Dict[int, Any] = field(default_factory=dict)  # further answers to log field by field, by number
 
 
 @dataclass
@@ -61,6 +63,7 @@ class FetchResult:
     account_faults_fetched: bool = False
     errors: List[str] = field(default_factory=list)
     auth_error: bool = False
+    calls: List[CallRecord] = field(default_factory=list)  # every request this poll made, for the request log
 
     def all_errors(self) -> List[str]:
         out = list(self.errors)
@@ -244,6 +247,7 @@ class Outcome:
     cleared: int = 0
     setting_changes: int = 0
     baselines: int = 0
+    field_changes: int = 0
 
     def summary(self) -> str:
         return "%d appliance(s), %d fault entr%s known, %d new fault(s), %d setting change(s)%s" % (
@@ -279,6 +283,61 @@ def _snapshot(conn: sqlite3.Connection, mac: str, kind: str, payload: Any, volat
         (now, mac, kind, fingerprint, body),
     )
     return True
+
+
+def _record_calls(conn: sqlite3.Connection, calls: List[CallRecord], poll_id: int) -> None:
+    """The request log: what was asked, how the server answered and how long it took (never the query string)."""
+    conn.executemany(
+        "INSERT INTO api_calls(taken_at, poll_id, kind, endpoint, status, ms, bytes, headers, error) VALUES(?,?,?,?,?,?,?,?,?)",
+        [
+            (c.at, poll_id, c.kind, c.endpoint, c.status, c.ms, c.size, json.dumps(c.headers, sort_keys=True) if c.headers else None, c.error)
+            for c in calls
+        ],
+    )
+
+
+def _record_fields(
+    conn: sqlite3.Connection, cfg: Config, a: ApplianceData, now: str, outcome: Outcome, notes: List[str]
+) -> List[observe.Change]:
+    """Log every field of everything the cloud said about this heater; returns the changes worth looking at."""
+    volatile = cfg.fault_options.volatile
+    news: List[observe.Change] = []
+
+    def one(source: str, payload: Any, **kwargs: Any) -> None:
+        changes, first = observe.record(conn, a.mac, source, payload, now, volatile, **kwargs)
+        if first:
+            if source == "status" and changes:
+                notes.append("Logging every field of the status answer (%d so far): ./bwctl fields lists them, ./bwctl changes shows what changed." % len(changes))
+            return
+        outcome.field_changes += len(changes)
+        news.extend(changes)
+
+    one("list", a.listing)
+    if a.status_fetched:
+        one("status", a.status)
+    if a.faults_fetched:
+        one("faults", a.faults, skip_lists=True)
+    for number, payload in sorted(a.extras.items()):
+        one("extra%d" % number, payload)
+    return news
+
+
+def _watch_alert(conn: sqlite3.Connection, cfg: Config, a: ApplianceData, changes: List[observe.Change], now: str) -> None:
+    """BW_WATCH_FIELDS: tell the owner when a field they care about changes."""
+    if cfg.watch_fields is None:
+        return
+    hits = [c for c in changes if cfg.watch_fields.search(c.name)]
+    if not hits:
+        return
+    lines = [
+        "%s: %s -> %s%s" % (c.name, c.old if c.old is not None else "(not there)", c.new if c.new is not None else "(gone)",
+                            "" if c.event == "changed" else "   [%s]" % c.event)
+        for c in hits[:12]
+    ]
+    if len(hits) > 12:
+        lines.append("... and %d more" % (len(hits) - 12))
+    enqueue(conn, kind="setting", title="Wave field changed — %s" % a.name,
+            body="%s\nNoticed: %s" % ("\n".join(lines), local_time(now, cfg.display_tz)), priority=3, now=now)
 
 
 def _record_status(conn: sqlite3.Connection, cfg: Config, a: ApplianceData, now: str, outcome: Outcome, notes: List[str]) -> None:
@@ -615,6 +674,12 @@ def apply_cycle(conn: sqlite3.Connection, cfg: Config, fetched: FetchResult, *, 
             names[a.mac] = a.name
             note = notes.setdefault(a.mac, [])
             _upsert_appliance(conn, a, now)
+            if cfg.log_fields:
+                changed = _section(conn, errors, "logging every field of %s" % a.name,
+                                   lambda a=a, note=note: _record_fields(conn, cfg, a, now, outcome, note))
+                if changed:
+                    _section(conn, errors, "checking the watched fields of %s" % a.name,
+                             lambda a=a, changed=changed: _watch_alert(conn, cfg, a, changed, now))
             if a.status_fetched:
                 # Raw responses are stored first, in their own savepoint, so a parsing bug can never lose them.
                 _section(conn, errors, "storing the status response of %s" % a.name,
@@ -656,6 +721,8 @@ def apply_cycle(conn: sqlite3.Connection, cfg: Config, fetched: FetchResult, *, 
              outcome.events_seen, len(new_faults)),
         )
         outcome.poll_id = int(cur.lastrowid)
+        if fetched.calls:  # a bug in the request log must never cost the poll itself, so its errors are only logged
+            _section(conn, [], "storing the request log", lambda: _record_calls(conn, fetched.calls, outcome.poll_id))
         _update_health(conn, cfg, outcome, fetched.auth_error, now)
     return outcome
 

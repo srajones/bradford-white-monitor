@@ -17,6 +17,7 @@ import email.utils
 import http.client
 import json
 import logging
+import re
 import socket
 import ssl
 import threading
@@ -32,7 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from .config import Config, RequestSpec
 from .errors import ApiError, AuthError, TransientError, WaveError
 from .readonly import check_read_only
-from .util import atomic_write_json, iso, jwt_claims, scrub
+from .util import atomic_write_json, iso, jwt_claims, scrub, truncate
 
 __all__ = ["ApiError", "AuthError", "TransientError", "WaveError"]
 
@@ -133,6 +134,48 @@ def retry_after_seconds(resp: "HttpResponse", default: float = 3600.0) -> float:
     return max(60.0, min(seconds, 6 * 3600.0))
 
 
+# --- a record of every request (for the request log) -------------------------
+# Response headers worth keeping: they say how the server is doing (rate limits, region, request ids), never who we are.
+_KEEP_HEADER = re.compile(
+    r"^(date|server|via|age|retry-after|content-type|content-length|cache-control|"
+    r"x-[a-z-]*(request|rate|limit|trace|correlation|region|version|cache|backend)[a-z-]*|"
+    r"(x-)?ratelimit[a-z-]*|apim[a-z-]*|(x-)?ms-[a-z-]*|x-ms-[a-z-]*)$"
+)
+MAX_CALL_RECORDS = 200
+
+
+@dataclass
+class CallRecord:
+    at: str
+    kind: str  # "api" (the Wave API) or "token" (the sign-in server)
+    endpoint: str  # "GET /wave/getApplianceStatus": never the query string, which can hold ids
+    status: Optional[int]
+    ms: int
+    size: int
+    headers: Dict[str, str]
+    error: Optional[str] = None
+
+
+def keep_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    return {k: truncate(v, 200) for k, v in headers.items() if _KEEP_HEADER.match(k.lower())}
+
+
+def note_call(
+    sink: List[CallRecord], kind: str, method: str, url: str, resp: Optional["HttpResponse"], started: float,
+    error: Optional[BaseException] = None,
+) -> None:
+    if len(sink) >= MAX_CALL_RECORDS:
+        return
+    sink.append(
+        CallRecord(
+            at=iso(), kind=kind, endpoint="%s %s" % (method, urllib.parse.urlsplit(url).path or "/"),
+            status=resp.status if resp is not None else None, ms=int((time.monotonic() - started) * 1000),
+            size=len(resp.body) if resp is not None else 0, headers=keep_headers(resp.headers) if resp is not None else {},
+            error=scrub(error, 200) if error is not None else None,
+        )
+    )
+
+
 def check_reachable(url: str, user_agent: str = "bwwatch", timeout: float = 10.0) -> Tuple[bool, str]:
     """Can we get *any* HTTP answer from this address? DNS, connection, proxy and TLS must all work.
 
@@ -229,6 +272,7 @@ class TokenManager:
         self.account_id: Optional[str] = cfg.account_id or None
         self.refresh_expires_at: Optional[str] = None
         self.retry_after = 0.0  # seconds the sign-in server last asked us to wait (0 = no request)
+        self.calls: List[CallRecord] = []  # sign-in requests of the current poll (the service stores and clears them)
 
     def _headers(self) -> Dict[str, str]:
         return {"User-Agent": self.cfg.user_agent, "Accept": "application/json"}
@@ -261,7 +305,13 @@ class TokenManager:
         return None
 
     def _post_token(self, form: Mapping[str, str], what: str) -> Dict[str, Any]:
-        resp = http_request("POST", self.cfg.token_url, headers=self._headers(), form=form, timeout=self.cfg.http_timeout)
+        started = time.monotonic()
+        try:
+            resp = http_request("POST", self.cfg.token_url, headers=self._headers(), form=form, timeout=self.cfg.http_timeout)
+        except WaveError as exc:
+            note_call(self.calls, "token", "POST", self.cfg.token_url, None, started, exc)
+            raise
+        note_call(self.calls, "token", "POST", self.cfg.token_url, resp, started)
         if resp.status == 200:
             data = resp.json()
             if not isinstance(data, dict):
@@ -361,6 +411,7 @@ class WaveApi:
         self.stop = stop or threading.Event()
         self.retry_delays = retry_delays
         self.retry_after = 0.0  # seconds the API last asked us to wait (0 = no request)
+        self.calls: List[CallRecord] = []  # every request of the current poll (the service stores and clears them)
 
     def _headers(self, token: str) -> Dict[str, str]:
         headers = {"User-Agent": self.cfg.user_agent, "Accept": "application/json"}
@@ -412,7 +463,13 @@ class WaveApi:
         resp: Optional[HttpResponse] = None
         for round_ in (1, 2):
             token = self.tokens.bearer(force=(round_ == 2))
-            resp = http_request(method, url, headers=self._headers(token), json_body=body, timeout=self.cfg.http_timeout)
+            started = time.monotonic()
+            try:
+                resp = http_request(method, url, headers=self._headers(token), json_body=body, timeout=self.cfg.http_timeout)
+            except WaveError as exc:
+                note_call(self.calls, "api", method, url, None, started, exc)
+                raise
+            note_call(self.calls, "api", method, url, resp, started)
             if resp.status == 401 and round_ == 1:
                 log.info("the API answered 401; refreshing the sign-in and trying once more")
                 continue

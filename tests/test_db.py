@@ -58,10 +58,39 @@ class Migration(Base):
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute("UPDATE faults SET state = 'nonsense'")
 
+    V3_TABLES = {"field_state", "observations", "energy_usage", "api_calls", "discovery"}
+
+    def tables(self, conn):
+        return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+    def test_old_databases_gain_the_logging_tables(self):
+        self.make_v1()
+        conn, _ = self.open()
+        self.assertTrue(self.V3_TABLES <= self.tables(conn))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM faults").fetchone()[0], 1, "nothing was lost on the way")
+
+    def test_a_version_2_database_gains_only_the_new_tables(self):
+        self.make_v1()
+        raw = sqlite3.connect(str(self.dir / db.DB_NAME))
+        raw.execute("ALTER TABLE faults ADD COLUMN state TEXT CHECK (state IN ('active', 'cleared'))")
+        raw.execute("ALTER TABLE faults ADD COLUMN cleared_seen_at TEXT")
+        raw.execute("PRAGMA user_version=2")
+        raw.commit()
+        raw.close()
+        conn, _ = self.open()
+        self.assertTrue(self.V3_TABLES <= self.tables(conn))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+
+    def test_a_new_database_has_every_table(self):
+        conn, _ = self.open()
+        self.assertTrue(self.V3_TABLES <= self.tables(conn))
+        for table in self.V3_TABLES:
+            conn.execute("SELECT * FROM %s LIMIT 1" % table)
+
     def test_a_new_database_has_them_from_the_start(self):
         conn, _ = self.open()
         self.assertTrue({"state", "cleared_seen_at"} <= {r[1] for r in conn.execute("PRAGMA table_info(faults)")})
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
 
     def test_the_migration_is_all_or_nothing(self):
         self.make_v1()

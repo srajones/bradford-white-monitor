@@ -30,7 +30,7 @@ from .util import fsync_dir, iso, utcnow
 log = logging.getLogger("bwwatch.db")
 
 DB_NAME = "bwwatch.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA: Tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS meta(
@@ -121,6 +121,83 @@ SCHEMA: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(id) WHERE status = 'pending'",
 )
 
+# Added in schema 3 ("log everything we can read"). An older database gets exactly these on its next start.
+SCHEMA_V3: Tuple[str, ...] = (
+    # The latest value of every field the cloud has ever reported, per heater and source (list / status / ...).
+    """CREATE TABLE IF NOT EXISTS field_state(
+        mac             TEXT NOT NULL,
+        source          TEXT NOT NULL,
+        path            TEXT NOT NULL,
+        value           TEXT,
+        vtype           TEXT NOT NULL,
+        first_seen_at   TEXT NOT NULL,
+        last_changed_at TEXT NOT NULL,
+        last_seen_at    TEXT NOT NULL,
+        changes         INTEGER NOT NULL DEFAULT 0,
+        present         INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (mac, source, path)
+    ) WITHOUT ROWID""",
+    # Every change of every field (and every time one appears or disappears): a complete, compact history.
+    """CREATE TABLE IF NOT EXISTS observations(
+        id        INTEGER PRIMARY KEY,
+        taken_at  TEXT NOT NULL,
+        mac       TEXT NOT NULL,
+        source    TEXT NOT NULL,
+        path      TEXT NOT NULL,
+        event     TEXT NOT NULL CHECK (event IN ('start', 'new', 'changed', 'gone', 'back')),
+        old_value TEXT,
+        new_value TEXT,
+        vtype     TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS observations_time ON observations(taken_at)",
+    "CREATE INDEX IF NOT EXISTS observations_path ON observations(mac, source, path, id)",
+    # Energy used per hour/day, split into heat pump and element: the clearest sign of what the heater is really doing.
+    """CREATE TABLE IF NOT EXISTS energy_usage(
+        mac              TEXT NOT NULL,
+        view             TEXT NOT NULL,
+        ts               TEXT NOT NULL,
+        total_energy     REAL,
+        heat_pump_energy REAL,
+        element_energy   REAL,
+        reported_minutes INTEGER,
+        extra            TEXT,
+        first_seen_at    TEXT NOT NULL,
+        last_seen_at     TEXT NOT NULL,
+        revisions        INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (mac, view, ts)
+    ) WITHOUT ROWID""",
+    # Every request bwwatch sent: what, when, the answer's status, how long it took and which headers came back.
+    """CREATE TABLE IF NOT EXISTS api_calls(
+        id       INTEGER PRIMARY KEY,
+        taken_at TEXT NOT NULL,
+        poll_id  INTEGER,
+        kind     TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        status   INTEGER,
+        ms       INTEGER,
+        bytes    INTEGER,
+        headers  TEXT,
+        error    TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS api_calls_time ON api_calls(taken_at)",
+    # The search for the Notifications request: every guess and what the server said (see discover.py).
+    """CREATE TABLE IF NOT EXISTS discovery(
+        id       INTEGER PRIMARY KEY,
+        tried_at TEXT NOT NULL,
+        key      TEXT NOT NULL UNIQUE,
+        name     TEXT NOT NULL,
+        method   TEXT NOT NULL,
+        target   TEXT NOT NULL,
+        body     TEXT,
+        status   INTEGER,
+        verdict  TEXT NOT NULL,
+        note     TEXT,
+        sample   TEXT,
+        origin   TEXT NOT NULL DEFAULT 'builtin'
+    )""",
+)
+SCHEMA = SCHEMA + SCHEMA_V3
+
 
 class DatabaseTooNew(Exception):
     """The database was written by a newer bwwatch; refuse rather than guess."""
@@ -189,10 +266,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
         )
     if version == SCHEMA_VERSION:
         return
-    if version == 1:  # 1 -> 2: events know whether they are active or cleared
+    if version in (1, 2):  # older databases keep everything they have and gain what is new, in one transaction
         with tx(conn):
-            conn.execute("ALTER TABLE faults ADD COLUMN state TEXT CHECK (state IN ('active', 'cleared'))")
-            conn.execute("ALTER TABLE faults ADD COLUMN cleared_seen_at TEXT")
+            if version == 1:  # 1 -> 2: events know whether they are active or cleared
+                conn.execute("ALTER TABLE faults ADD COLUMN state TEXT CHECK (state IN ('active', 'cleared'))")
+                conn.execute("ALTER TABLE faults ADD COLUMN cleared_seen_at TEXT")
+            for statement in SCHEMA_V3:  # 2 -> 3: the logs of every field, energy use, requests and the search
+                conn.execute(statement)
             conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         return
     with tx(conn):

@@ -231,6 +231,10 @@ class Config:
     webhook: Optional[WebhookConfig]
     homeassistant: Optional[HomeAssistantConfig] = None
     warnings: Tuple[str, ...] = field(default=())
+    # --- log everything we can read ---
+    log_fields: bool = True  # keep a history of every field in the list/status/... answers
+    watch_fields: Optional["re.Pattern[str]"] = None  # alert when a field whose name matches this changes
+    keep_days: int = 365  # how long field and request history is kept (0 = forever)
 
     @property
     def token_url(self) -> str:
@@ -471,6 +475,7 @@ def _build(env: Mapping[str, str]) -> Config:
 
     display_tz = _get(env, "DISPLAY_TZ", "UTC") or "UTC"
 
+
     return Config(
         data_dir=Path(_get(env, "DATA_DIR", "/data")),
         interval=_int(env, "BW_POLL_INTERVAL_SECONDS", 3600, MIN_POLL_SECONDS, 86400),
@@ -508,4 +513,7 @@ def _build(env: Mapping[str, str]) -> Config:
         webhook=webhook,
         homeassistant=homeassistant,
         warnings=tuple(warnings),
+        log_fields=_bool(env, "BW_LOG_FIELDS", True),
+        watch_fields=_regex(env, "BW_WATCH_FIELDS"),
+        keep_days=_int(env, "BW_KEEP_HISTORY_DAYS", 365, 0, 3650),
     )

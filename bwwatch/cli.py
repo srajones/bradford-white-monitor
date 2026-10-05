@@ -31,6 +31,7 @@ from .readings import extract_reading, reading_from_row
 from .service import Service, healthcheck
 from .util import iso, local_time, truncate
 from .verify import format_checks, overall_ok, run_checks
+from . import views
 from .wave import TokenManager, TokenStore, WaveApi, parse_redirect
 
 log = logging.getLogger("bwwatch")
@@ -527,6 +528,8 @@ COMMANDS: Dict[str, Callable[[Config, argparse.Namespace], int]] = {
     "dbcheck": cmd_dbcheck,
     "test-notify": cmd_test_notify,
     "verify": cmd_verify,
+    "fields": views.cmd_fields,
+    "changes": views.cmd_changes,
     "healthcheck": cmd_healthcheck,
 }
 # `setup` and `version` take no loaded configuration, so they are handled before COMMANDS.
@@ -570,6 +573,7 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--print-env", action="store_true", help="print the settings file the wizard produced (used by install.sh)")
     group.add_argument("--verify", action="store_true", help="check the installed .env reached the service exactly as chosen")
     group.add_argument("--cleanup", action="store_true", help="remove the wizard's temporary output files")
+    views.add_arguments(sub)
     sub.add_parser("healthcheck", help="exit 0 if the service is alive (used by Docker)")
     sub.add_parser("version", help="print the version")
     return parser
