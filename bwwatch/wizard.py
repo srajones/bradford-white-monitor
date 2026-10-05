@@ -594,15 +594,26 @@ class Wizard:
         self.c.heading("Step 4 of 6: Sign in to Wave (once)")
         cfg, tokens, api = self._api()
         if tokens.has_credentials():
-            self.c.say("This server is already signed in to Wave.")
-            if self.c.confirm("Keep that sign-in?", True):
-                try:
-                    if self._show_heaters(api, cfg):
-                        return True
-                except AuthError:
-                    self.c.say("That sign-in no longer works, so you need to sign in again.", "warn")
-                except WaveError as exc:
-                    self.c.say("Could not read your heater: %s" % exc, "fail")
+            if (self.data_dir / "token.json").exists() or cfg.seed_refresh_token:
+                self.c.say("This server is already signed in to Wave.")
+                if self.c.confirm("Keep that sign-in?", True):
+                    try:
+                        if self._show_heaters(api, cfg):
+                            return True
+                    except AuthError:
+                        self.c.say("That sign-in no longer works, so you need to sign in again.", "warn")
+                    except WaveError as exc:
+                        self.c.say("Could not read your heater: %s" % exc, "fail")
+            elif cfg.username and cfg.password:
+                self.c.say("Credentials found in settings (%s)." % cfg.username)
+                if self.c.confirm("Sign in automatically with those credentials?", True):
+                    try:
+                        tokens.login_with_credentials()
+                        self.c.say("Signed in automatically.", "ok")
+                        if self._show_heaters(api, cfg):
+                            return True
+                    except WaveError as exc:
+                        self.c.say("Automatic sign-in failed: %s" % exc, "fail")
         failures = 0
         while True:
             link = tokens.authorization_url(secrets.token_urlsafe(9), secrets.token_urlsafe(9))

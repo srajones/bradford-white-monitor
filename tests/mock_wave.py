@@ -186,6 +186,8 @@ class MockWave:
         elif name in self.extra_routes:
             status, body = self.extra_routes[name]
             h.reply(status, body)
+        elif name == "getEnergyUsage":
+            h.reply(200, [])
         else:
             h.reply(404, {"message": "Not Found"})
 
@@ -254,6 +256,22 @@ class _Handler(BaseHTTPRequestHandler):
             mock.requests.append(rec)
         if parsed.path == "/auth/token":
             mock.handle_token(self, rec)
+        elif parsed.path in ("/auth/authorize", "/authorize"):
+            html = '<html><script>SETTINGS={"csrf":"mock-csrf-token-12345","transId":"mock-trans-id-67890"};</script></html>'
+            self.reply(200, html, headers={"Content-Type": "text/html"})
+        elif parsed.path in ("/auth/SelfAsserted", "/SelfAsserted"):
+            form = {k: v[0] for k, v in urllib.parse.parse_qs(rec["body"]).items()}
+            if form.get("email") and form.get("password") == "wrong":
+                self.reply(200, {"status": "400", "message": "invalid credentials"})
+            else:
+                self.reply(200, {"status": "200"})
+        elif parsed.path in ("/auth/api/CombinedSigninAndSignUp/confirmed", "/api/CombinedSigninAndSignUp/confirmed"):
+            code = mock.issue_login_code("mock-login-code-999")
+            redir = f"{REDIRECT}?state=test&code={code}"
+            self.send_response(302)
+            self.send_header("Location", redir)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif parsed.path.startswith("/wave/"):
             mock.handle_api(self, rec)
         elif not mock.handle_sink(self, rec):

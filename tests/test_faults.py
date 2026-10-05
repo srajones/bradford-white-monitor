@@ -68,6 +68,32 @@ class FindList(unittest.TestCase):
         by_code = {e.code: e.state for e in events}
         self.assertEqual(by_code, {"10": "cleared", "3": "active"})
 
+    def test_live_wave_error_history_payload(self):
+        """Exact payload structure returned by the live Bradford White Wave API."""
+        payload = {
+            "success": True,
+            "active_errors": [],
+            "error_history": [
+                {
+                    "FaultCode": 10,
+                    "timestamp": "October 04, 2026 at 01:15 PM",
+                    "count": 9,
+                    "title": "(Cleared) Superheat Fault",
+                    "message": "The control has detected an issue in the superheat stage of the refrigeration cycle, and the system may be too low in refrigerant.",
+                }
+            ],
+        }
+        events, where = extract_events(payload, OPTS)
+        self.assertEqual(where, "error_history")
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev.code, "10")
+        self.assertEqual(ev.state, "cleared")
+        self.assertIn("Superheat Fault", ev.description)
+        self.assertNotIn("(Cleared)", ev.description)
+        self.assertEqual(ev.occurred_at, "October 04, 2026 at 01:15 PM")
+        self.assertEqual(ev.fingerprint, "code=10|at=October 04, 2026 at 01:15 PM")
+
     def test_empty_list_is_recognised_as_no_faults(self):
         self.assertEqual(find_event_list({"notifications": []})[0], [])
         self.assertEqual(find_event_list([])[0], [])

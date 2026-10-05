@@ -3,6 +3,7 @@
 #
 #   status                  one-screen summary (service, last poll, heater settings, faults)
 #   faults [--all] [--raw]  the faults it has logged
+#   energy [--view ...]     heat pump vs backup element electricity usage (kWh)
 #   logs [-f]               what the service is doing (-f follows)
 #   verify                  is everything working? (the installer's check)
 #   test-notify [--event fault]   send a test alert to every channel

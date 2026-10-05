@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import email.utils
 import http.client
+import http.cookiejar
 import json
 import logging
 import re
@@ -22,6 +23,7 @@ import socket
 import ssl
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -291,7 +293,7 @@ class TokenManager:
         return "%s?%s" % (self.cfg.authorize_url, query)
 
     def has_credentials(self) -> bool:
-        return bool(self.store.load() or self.cfg.seed_refresh_token)
+        return bool(self.store.load() or self.cfg.seed_refresh_token or (self.cfg.username and self.cfg.password))
 
     def _current_refresh_token(self) -> Optional[str]:
         saved = self.store.load()
@@ -302,7 +304,103 @@ class TokenManager:
             self.store.save(self.cfg.seed_refresh_token, source="env")
             log.info("adopted BW_REFRESH_TOKEN from the environment; later tokens are kept in %s", self.store.path)
             return self.cfg.seed_refresh_token
+        if self.cfg.username and self.cfg.password:
+            log.info("no token found; attempting automated sign-in using credentials from .env")
+            self.login_with_credentials()
+            saved = self.store.load()
+            if saved:
+                return str(saved["refresh_token"])
         return None
+
+    def login_with_credentials(
+        self, username: Optional[str] = None, password: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Perform automated headless Azure AD B2C sign-in using username and password."""
+        user = (username or self.cfg.username or "").strip()
+        pwd = password if password is not None else self.cfg.password
+        if not user or not pwd:
+            raise AuthError("username and password are required for automated login")
+
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+        state = uuid.uuid4().hex
+        nonce = uuid.uuid4().hex
+        auth_url = self.authorization_url(state, nonce)
+        req = urllib.request.Request(
+            auth_url,
+            headers={
+                "User-Agent": self.cfg.user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        try:
+            resp = opener.open(req, timeout=self.cfg.http_timeout)
+            html = resp.read().decode("utf-8", "replace")
+        except Exception as exc:
+            raise AuthError("failed to load Azure AD B2C sign-in page: %s" % scrub(exc, 150))
+
+        csrf_match = re.search(r'\"csrf\":\"(.*?)\"', html)
+        trans_match = re.search(r'\"transId\":\"(.*?)\"', html)
+        if not csrf_match or not trans_match:
+            raise AuthError("Azure AD B2C sign-in page did not return required tokens")
+        csrf = csrf_match.group(1)
+        trans_id = trans_match.group(1)
+
+        b2c_base = self.cfg.auth_base.rsplit("/oauth2", 1)[0]
+        self_asserted_url = f"{b2c_base}/SelfAsserted?tx={urllib.parse.quote(trans_id)}&p=B2C_1_Wave_SignIn"
+        post_data = {
+            "request_type": "RESPONSE",
+            "email": user,
+            "password": pwd,
+        }
+        post_bytes = urllib.parse.urlencode(post_data).encode("ascii")
+        req2 = urllib.request.Request(
+            self_asserted_url,
+            data=post_bytes,
+            headers={
+                "User-Agent": self.cfg.user_agent,
+                "X-CSRF-TOKEN": csrf,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        try:
+            resp2 = opener.open(req2, timeout=self.cfg.http_timeout)
+            raw2 = resp2.read().decode("utf-8", "replace")
+            res2 = json.loads(raw2)
+        except Exception as exc:
+            raise AuthError("credential submission to Azure AD B2C failed: %s" % scrub(exc, 150))
+
+        if str(res2.get("status")) != "200":
+            msg = res2.get("message") or res2.get("error_description") or "invalid username or password"
+            raise AuthError("sign-in rejected by Azure AD B2C: %s" % scrub(msg, 200))
+
+        confirmed_url = (
+            f"{b2c_base}/api/CombinedSigninAndSignUp/confirmed?rememberMe=false"
+            f"&csrf_token={urllib.parse.quote(csrf)}&tx={urllib.parse.quote(trans_id)}&p=B2C_1_Wave_SignIn"
+        )
+        opener_noredir = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), _NoRedirect())
+        req3 = urllib.request.Request(
+            confirmed_url,
+            headers={"User-Agent": self.cfg.user_agent},
+        )
+        redirect_loc = None
+        try:
+            opener_noredir.open(req3, timeout=self.cfg.http_timeout)
+        except urllib.error.HTTPError as exc:
+            redirect_loc = exc.headers.get("Location")
+        except Exception as exc:
+            raise AuthError("failed to complete Azure AD B2C sign-in confirmation: %s" % scrub(exc, 150))
+
+        if not redirect_loc:
+            raise AuthError("sign-in succeeded but no redirect location was returned by Azure AD B2C")
+
+        code, _ = parse_redirect(redirect_loc)
+        self.exchange_code(code)
+        log.info("completed automated headless sign-in for %s (account %s)", scrub(user, 50), self.account_id)
+        return self.store.load() or {}
 
     def _post_token(self, form: Mapping[str, str], what: str) -> Dict[str, Any]:
         started = time.monotonic()

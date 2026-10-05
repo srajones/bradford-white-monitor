@@ -80,7 +80,8 @@ class Pacing(WaveTestCase):
         svc.cycle()
         sign_in = len(self.mock.hits("/auth/token"))
         api = len(self.mock.hits("/wave/"))
-        self.assertEqual((sign_in, api), (1, 3), "one sign-in refresh + list + status + fault history, for one heater")
+        expected_api = 5 if svc.cfg.log_energy else 3
+        self.assertEqual((sign_in, api), (1, expected_api), "one sign-in refresh + list + status + fault history (+ energy), for one heater")
 
     def test_failed_polls_make_no_extra_requests_beyond_bounded_retries(self):
         svc = self.service()

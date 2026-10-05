@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import observe
-from .config import Config
+from .config import Config, RequestSpec
 from .db import meta_get, meta_set, savepoint, tx
 from .errors import AuthError, WaveError
 from .faults import FaultEvent, digest, extract_events, scan_state
@@ -51,6 +51,10 @@ class ApplianceData:
     status_fetched: bool = False
     faults: Any = None
     faults_fetched: bool = False
+    energy_hourly: Any = None
+    energy_hourly_fetched: bool = False
+    energy_daily: Any = None
+    energy_daily_fetched: bool = False
     errors: List[str] = field(default_factory=list)
     extras: Dict[int, Any] = field(default_factory=dict)  # further answers to log field by field, by number
 
@@ -137,6 +141,15 @@ def fetch(
             data.status_fetched, data.status = _try(data.errors, "status", lambda: api.call(spec, ctx))
         if fault_spec is not None and fault_spec.per_appliance:
             data.faults_fetched, data.faults = _try(data.errors, "fault request", lambda: api.call(fault_spec, ctx))
+        if getattr(cfg, "log_energy", True):
+            hourly_spec = RequestSpec("POST", "/wave/getEnergyUsage", {"mac_address": data.mac, "view_type": "hourly"})
+            data.energy_hourly_fetched, data.energy_hourly = _try(
+                [], "energy usage (hourly)", lambda: api.call(hourly_spec, ctx)
+            )
+            daily_spec = RequestSpec("POST", "/wave/getEnergyUsage", {"mac_address": data.mac, "view_type": "daily"})
+            data.energy_daily_fetched, data.energy_daily = _try(
+                [], "energy usage (daily)", lambda: api.call(daily_spec, ctx)
+            )
         result.appliances.append(data)
     return result
 
@@ -383,6 +396,42 @@ def _record_status(conn: sqlite3.Connection, cfg: Config, a: ApplianceData, now:
                 priority=3,
                 now=now,
             )
+
+
+def _record_energy(conn: sqlite3.Connection, mac: str, view: str, payload: Any, now: str) -> int:
+    if not isinstance(payload, list):
+        return 0
+    count = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        ts = item.get("timestamp") or item.get("ts")
+        if not ts:
+            continue
+        total = item.get("total_energy")
+        hp = item.get("heat_pump_energy")
+        el = item.get("element_energy")
+        mins = item.get("reported_minutes")
+        known = {"timestamp", "ts", "total_energy", "heat_pump_energy", "element_energy", "reported_minutes"}
+        extra = {k: v for k, v in item.items() if k not in known}
+        extra_json = json.dumps(extra, sort_keys=True) if extra else None
+
+        conn.execute(
+            """INSERT INTO energy_usage(mac, view, ts, total_energy, heat_pump_energy, element_energy,
+                                       reported_minutes, extra, first_seen_at, last_seen_at, revisions)
+               VALUES(?,?,?,?,?,?,?,?,?,?,0)
+               ON CONFLICT(mac, view, ts) DO UPDATE SET
+                 total_energy = excluded.total_energy,
+                 heat_pump_energy = excluded.heat_pump_energy,
+                 element_energy = excluded.element_energy,
+                 reported_minutes = excluded.reported_minutes,
+                 extra = excluded.extra,
+                 last_seen_at = excluded.last_seen_at,
+                 revisions = revisions + 1""",
+            (mac, view, str(ts), total, hp, el, mins, extra_json, now, now),
+        )
+        count += 1
+    return count
 
 
 def describe_event(ev: FaultEvent, tz: str) -> str:
@@ -715,6 +764,12 @@ def apply_cycle(conn: sqlite3.Connection, cfg: Config, fetched: FetchResult, *, 
                 found = _section(conn, errors, "scanning the status of %s" % a.name,
                                  lambda a=a, note=note: _record_state(conn, cfg, a, now, outcome, note))
                 new_faults.extend(found or [])
+            if a.energy_hourly_fetched and a.energy_hourly:
+                _section(conn, errors, "recording hourly energy usage for %s" % a.name,
+                         lambda a=a: _record_energy(conn, a.mac, "hourly", a.energy_hourly, now))
+            if a.energy_daily_fetched and a.energy_daily:
+                _section(conn, errors, "recording daily energy usage for %s" % a.name,
+                         lambda a=a: _record_energy(conn, a.mac, "daily", a.energy_daily, now))
         if fetched.account_faults_fetched:
             names[ACCOUNT] = "your Wave account"
             note = notes.setdefault(ACCOUNT, [])

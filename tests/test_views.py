@@ -160,14 +160,34 @@ class Dates(unittest.TestCase):
         self.assertIn("something like", str(caught.exception))
 
 
+class EnergyView(ViewCase):
+    def test_empty_energy_table(self):
+        code, out = self.run_cmd(views.cmd_energy)
+        self.assertEqual(code, 0)
+        self.assertIn("No energy usage records found", out)
+
+    def test_energy_table_with_records(self):
+        self.svc.conn.execute(
+            """INSERT INTO energy_usage(mac, view, ts, total_energy, heat_pump_energy, element_energy, reported_minutes, first_seen_at, last_seen_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (MAC, "hourly", "2026-10-04T13:00:00", 0.693, 0.047, 0.646, 59, "2026-10-04T13:00:00Z", "2026-10-04T13:00:00Z"),
+        )
+        code, out = self.run_cmd(views.cmd_energy)
+        self.assertEqual(code, 0)
+        self.assertIn("0.646 [BACKUP ELEMENT]", out)
+        self.assertIn("0.047", out)
+
+
 class Parser(unittest.TestCase):
     def test_the_commands_exist_and_parse(self):
         parser = cli.build_parser()
         args = parser.parse_args(["changes", "--around", "2026-10-04 13:15", "--minutes", "60", "--match", "x"])
         self.assertEqual((args.command, args.minutes, args.match), ("changes", 60, "x"))
         self.assertEqual(parser.parse_args(["fields"]).command, "fields")
+        self.assertEqual(parser.parse_args(["energy"]).command, "energy")
         self.assertIn("fields", cli.COMMANDS)
         self.assertIn("changes", cli.COMMANDS)
+        self.assertIn("energy", cli.COMMANDS)
 
 
 if __name__ == "__main__":

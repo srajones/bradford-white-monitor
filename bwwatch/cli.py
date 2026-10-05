@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from . import __version__, views
-from .config import Config, ConfigError, RequestSpec
+from .config import Config, ConfigError, RequestSpec, load_env_file
 from .cycle import describe_event, enqueue, fetch
 from .db import DB_NAME, DatabaseTooNew, backup_now, connect, init_schema, integrity_check, list_backups, open_database, table_counts, tx
 from .discover import CANDIDATES, forget, load, try_candidates
@@ -148,6 +148,40 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
 # --- login ------------------------------------------------------------------
 def cmd_login(cfg: Config, args: argparse.Namespace) -> int:
     _store, tokens, api = _make_api(cfg)
+    auto = getattr(args, "auto", False)
+    if cfg.username and cfg.password:
+        use_auto = auto
+        if not auto:
+            if sys.stdin.isatty():
+                try:
+                    ans = input("Found credentials in .env (%s). Sign in automatically? [Y/n]: " % cfg.username).strip().lower()
+                    use_auto = ans in ("", "y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    return 130
+            else:
+                use_auto = True
+
+        if use_auto:
+            print("Signing in to Wave automatically using credentials from .env...")
+            try:
+                tokens.login_with_credentials()
+            except WaveError as exc:
+                print("Automatic sign-in failed: %s" % exc, file=sys.stderr)
+                return 1
+            try:
+                appliances = api.list_appliances()
+            except WaveError as exc:
+                print("Signed in, but reading the appliance list failed: %s" % exc, file=sys.stderr)
+                return 1
+            print("\nSigned in successfully. The refresh token is saved in %s." % (cfg.data_dir / "token.json"))
+            print("Appliances on this account: %d" % len(appliances))
+            for item in appliances:
+                print("  - %s  mac=%s  serial=%s  type=%s" % (
+                    item.get("friendlyName"), item.get("macAddress"), item.get("serialNumber"), item.get("applianceType")
+                ))
+            print("\nNext:  ./bwctl check     (then)     ./bwctl start")
+            return 0
+
     state, nonce = secrets.token_urlsafe(9), secrets.token_urlsafe(9)
     print(LOGIN_HELP.format(url=tokens.authorization_url(state, nonce)))
     try:
@@ -211,13 +245,22 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
             problems += _print_fault_check(cfg, a.faults, "    ")
         elif cfg.fault_request is not None and cfg.fault_request.per_appliance:
             print("    Fault history:  request failed (see errors below)")
+        if a.energy_hourly_fetched and a.energy_hourly:
+            print("    Energy usage:   hourly readings available (%d records; see ./bwctl energy)" % len(a.energy_hourly))
     if fetched.account_faults_fetched:
         print("\n  Account-level fault history:")
         problems += _print_fault_check(cfg, fetched.account_faults, "    ")
     if cfg.fault_request is None:
-        print("\nFault history:  NOT CONFIGURED in .env. bwwatch tries GET /wave/getApplianceErrors on its own.")
-        print("                Until that answers, only settings changes and fault-like status fields are watched.")
-        print("                See README 'Finding the fault request'.")
+        conn_check = _open_existing_db(cfg)
+        learned_spec = load(conn_check) if conn_check else None
+        if conn_check:
+            conn_check.close()
+        if learned_spec:
+            print("\nFault history:  learned automatically -> %s" % learned_spec.describe())
+        else:
+            print("\nFault history:  NOT CONFIGURED in .env. bwwatch tries GET /wave/getApplianceErrors on its own.")
+            print("                Until that answers, only settings changes and fault-like status fields are watched.")
+            print("                See README 'Finding the fault request'.")
     errors = fetched.all_errors()
     for err in errors:
         print("\nERROR: %s" % err)
@@ -412,6 +455,9 @@ def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
         "polls": "SELECT * FROM polls ORDER BY id",
         "readings": "SELECT r.taken_at, a.name AS appliance, r.mac, r.mode, r.mode_value, r.setpoint_f, r.temps "
                     "FROM readings r LEFT JOIN appliances a ON a.mac = r.mac ORDER BY r.id",
+        "energy": "SELECT e.ts AS timestamp, a.name AS appliance, e.mac, e.view, e.total_energy, e.heat_pump_energy, "
+                  "e.element_energy, e.reported_minutes FROM energy_usage e "
+                  "LEFT JOIN appliances a ON a.mac = e.mac ORDER BY e.ts",
     }
     try:
         cursor = conn.execute(queries[args.table])
@@ -603,6 +649,7 @@ COMMANDS: Dict[str, Callable[[Config, argparse.Namespace], int]] = {
     "fields": views.cmd_fields,
     "changes": views.cmd_changes,
     "calls": views.cmd_calls,
+    "energy": views.cmd_energy,
     "discover": cmd_discover,
     "healthcheck": cmd_healthcheck,
 }
@@ -618,7 +665,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", help="DEBUG, INFO, WARNING (default: INFO for `run`, WARNING otherwise)")
     sub = parser.add_subparsers(dest="command", metavar="command")
     sub.add_parser("run", help="run the watcher (the default)")
-    sub.add_parser("login", help="sign in once through your browser and save the refresh token")
+    p_login = sub.add_parser("login", help="sign in to Wave and save the refresh token (supports automated login via .env)")
+    p_login.add_argument("--auto", action="store_true", help="sign in automatically using credentials from .env without prompting")
     sub.add_parser("check", help="read everything once and show what bwwatch understands (writes nothing)")
     p = sub.add_parser("call", help="make one read-only request and print the answer")
     p.add_argument("request", help="e.g. 'GET /wave/getApplianceStatus?macAddress={mac}'")
@@ -631,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="show every fault")
     p.add_argument("--raw", action="store_true", help="also print each fault's stored raw data")
     p = sub.add_parser("export", help="write a table as CSV")
-    p.add_argument("table", choices=("faults", "polls", "readings"))
+    p.add_argument("table", choices=("faults", "polls", "readings", "energy"))
     p.add_argument("--out", help="file to write (default: standard output)")
     sub.add_parser("backup", help="write a verified backup of the database now")
     sub.add_parser("dbcheck", help="verify the database and list backups")
@@ -668,7 +716,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if command == "setup":  # must work even when the current settings are broken - it repairs them
             return cmd_setup(args)
-        cfg = Config.from_env(os.environ)
+        merged_env = dict(os.environ)
+        merged_env.update(load_env_file(".env"))
+        cfg = Config.from_env(merged_env)
         prepare_runtime(cfg.data_dir)
         if command == "run":
             raw = os.environ.get("LOG_FILE")

@@ -12,7 +12,32 @@ from .errors import ConfigError, ReadOnlyViolation
 from .readonly import check_read_only
 from .util import norm_key
 
-__all__ = ["Config", "ConfigError", "FaultOptions", "RequestSpec", "norm_key"]
+__all__ = ["Config", "ConfigError", "FaultOptions", "RequestSpec", "load_env_file", "norm_key"]
+
+
+def load_env_file(path: Path | str = ".env") -> Dict[str, str]:
+    """Parse a simple .env file into a dict (ignoring comments and empty lines)."""
+    env: Dict[str, str] = {}
+    p = Path(path)
+    if not p.is_file():
+        return env
+    try:
+        content = p.read_text(encoding="utf-8")
+    except OSError:
+        return env
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            env[key] = val
+    return env
+
 
 DEFAULT_API_BASE = "https://gw.prdapi.bradfordwhiteapps.com"
 DEFAULT_AUTH_BASE = (
@@ -231,8 +256,11 @@ class Config:
     webhook: Optional[WebhookConfig]
     homeassistant: Optional[HomeAssistantConfig] = None
     warnings: Tuple[str, ...] = field(default=())
+    username: str = ""
+    password: str = field(default="", repr=False)
     # --- log everything we can read ---
     log_fields: bool = True  # keep a history of every field in the list/status/... answers
+    log_energy: bool = True  # record hourly and daily energy usage (POST /wave/getEnergyUsage)
     watch_fields: Optional["re.Pattern[str]"] = None  # alert when a field whose name matches this changes
     keep_days: int = 365  # how long field and request history is kept (0 = forever)
     # While a Notifications entry is active, poll this often, but only for fault_poll_hours after it was first seen.
@@ -479,8 +507,9 @@ def _build(env: Mapping[str, str]) -> Config:
     display_tz = _get(env, "DISPLAY_TZ", "UTC") or "UTC"
 
 
+    default_data_dir = "data" if Path("data").is_dir() else "/data"
     return Config(
-        data_dir=Path(_get(env, "DATA_DIR", "/data")),
+        data_dir=Path(_get(env, "DATA_DIR", default_data_dir)),
         interval=_int(env, "BW_POLL_INTERVAL_SECONDS", 3600, MIN_POLL_SECONDS, 86400),
         api_base=api_base,
         auth_base=auth_base,
@@ -492,6 +521,8 @@ def _build(env: Mapping[str, str]) -> Config:
         extra_headers=extra_headers,
         account_id=_get(env, "BW_ACCOUNT_ID"),
         seed_refresh_token=_get(env, "BW_REFRESH_TOKEN"),
+        username=(_get(env, "BW_USERNAME") or _get(env, "USER")),
+        password=(_get(env, "BW_PASSWORD") or _get(env, "PASS")),
         allow_insecure_http=insecure,
         list_request=list_request,
         status_request=status_request,
@@ -517,6 +548,7 @@ def _build(env: Mapping[str, str]) -> Config:
         homeassistant=homeassistant,
         warnings=tuple(warnings),
         log_fields=_bool(env, "BW_LOG_FIELDS", True),
+        log_energy=_bool(env, "BW_LOG_ENERGY", True),
         watch_fields=_regex(env, "BW_WATCH_FIELDS"),
         keep_days=_int(env, "BW_KEEP_HISTORY_DAYS", 365, 0, 3650),
         fault_poll_interval=_int(env, "BW_FAULT_POLL_INTERVAL_SECONDS", 600, MIN_POLL_SECONDS, 86400),

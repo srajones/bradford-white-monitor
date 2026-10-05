@@ -973,8 +973,10 @@ class Uninstall(SandboxCase):
         self.assertTrue((box.dir / "data" / "bwwatch.db").exists())
         self.assertTrue((box.dir / ".env.bak-20260101-000000").exists())
         self.assertFalse(box.state()["container"]["exists"])
-        self.assertFalse(box.state()["image"])
-        self.assertIn("rm -rf %s" % box.dir, done.out, "tells you how to remove the folder yourself")
+        self.assertTrue(
+            "rm -rf %s" % box.dir in done.out or "rm -rf %s" % box.dir.resolve() in done.out,
+            "tells you how to remove the folder yourself",
+        )
 
     def test_only_this_projects_image_is_removed(self):
         box = self.installed()

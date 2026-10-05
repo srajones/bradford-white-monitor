@@ -185,6 +185,60 @@ def cmd_calls(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_energy(cfg: Config, args: argparse.Namespace) -> int:
+    """Show recorded energy usage: heat pump vs backup electric element (kWh)."""
+    conn = open_db(cfg)
+    if conn is None:
+        print("No database yet - has the service run?")
+        return 1
+    try:
+        view = getattr(args, "view", "hourly") or "hourly"
+        limit = getattr(args, "limit", 24)
+        where = ["e.view = ?"]
+        params: List[Any] = [view]
+        if getattr(args, "mac", None):
+            where.append("e.mac = ?")
+            params.append(args.mac)
+        if getattr(args, "element_only", False):
+            where.append("e.element_energy > 0")
+
+        query = (
+            "SELECT e.*, a.name AS appliance FROM energy_usage e "
+            "LEFT JOIN appliances a ON a.mac = e.mac "
+            + ("WHERE " + " AND ".join(where) if where else "")
+            + " ORDER BY e.ts DESC LIMIT ?"
+        )
+        params.append(limit if limit > 0 else 500)
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            print("No energy usage records found for view %r." % view)
+            return 0
+        several = len({r["mac"] for r in rows}) > 1
+        lines = []
+        for r in reversed(rows):
+            hp = "%.3f" % r["heat_pump_energy"] if r["heat_pump_energy"] is not None else "-"
+            el = "%.3f" % r["element_energy"] if r["element_energy"] is not None else "-"
+            tot = "%.3f" % r["total_energy"] if r["total_energy"] is not None else "-"
+            mins = str(r["reported_minutes"]) if r["reported_minutes"] is not None else "-"
+            flag = " [BACKUP ELEMENT]" if (r["element_energy"] or 0) > 0.05 else ""
+            row = [
+                local_time(r["ts"], cfg.display_tz),
+                hp,
+                el + flag,
+                tot,
+                mins,
+            ]
+            if several:
+                row.insert(1, r["appliance"] or r["mac"])
+            lines.append(row)
+        headers = ("WHEN",) + (("HEATER",) if several else ()) + ("HEAT PUMP (kWh)", "ELEMENT (kWh)", "TOTAL (kWh)", "MINS")
+        print("Energy usage (%s view, latest %d entries):" % (view, len(rows)))
+        print(table(headers, lines))
+    finally:
+        conn.close()
+    return 0
+
+
 def add_arguments(sub: Any) -> None:
     """The sub-commands this module provides (called by cli.build_parser)."""
     p = sub.add_parser("fields", help="list every field the cloud reports, with its current value and change count")
@@ -198,4 +252,9 @@ def add_arguments(sub: Any) -> None:
     p.add_argument("--all", action="store_true", help="include each source's starting picture (the first values seen)")
     p = sub.add_parser("calls", help="the request log: how many calls, how fast, and any HTTP 429 slow-downs")
     p.add_argument("--hours", type=float, default=24.0, help="how far back to look (0 = everything; default 24)")
+    p = sub.add_parser("energy", help="show recorded energy usage (heat pump vs backup element in kWh)")
+    p.add_argument("--view", choices=("hourly", "daily"), default="hourly", help="hourly or daily view (default: hourly)")
+    p.add_argument("--limit", type=int, default=24, help="how many entries to show (default 24; 0 = all)")
+    p.add_argument("--mac", help="filter by appliance mac address")
+    p.add_argument("--element-only", action="store_true", help="only show intervals where the backup element fired")
 

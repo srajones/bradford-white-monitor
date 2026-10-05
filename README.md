@@ -162,12 +162,14 @@ then `cd / && rm -rf /opt/bwheater` if you want the program files gone too.
 
 ## Is it lightweight? Does it run a browser?
 
-**No browser, and very little of anything.** bwwatch talks to Bradford White's API directly with ordinary HTTPS
+**No browser required on the server, and very little of anything.** bwwatch talks to Bradford White's API directly with ordinary HTTPS
 requests from Python's standard library — no Chrome, no Selenium or Playwright, no Node, and not a single extra package
-to install (so there is nothing to go stale or be hijacked). The only browser involved is **yours**, once: Bradford White's
-sign-in page can't be scripted reliably (the author of the community client tried headless login and gave up), so you
-sign in in your own browser, paste back the address it ends on, and from then on bwwatch uses the saved refresh token
-against the API.
+to install. For sign-in, you have two options:
+1. **Automated Headless Sign-in (Recommended for VPS):** Put `BW_USERNAME` and `BW_PASSWORD` (or `USER` and `PASS`)
+   in your `.env`. bwwatch automatically handles Azure AD B2C authentication headlessly on startup, exchanges the OAuth
+   tokens, and keeps rotating the refresh token in `./data/token.json` without any browser or web interaction needed on your VPS!
+2. **One-Time Browser Link:** Alternatively, run `./bwctl login` to display a sign-in link, authenticate in your browser,
+   and paste back the redirect address.
 
 Measured on a running container: about **20–35 MB of RAM** and ~0 % CPU (it is asleep between polls and keeps no
 connection open); the image is the small Debian-based `python:3.12-slim` plus about 300 KB of code; the data folder is
@@ -180,9 +182,9 @@ well under 1 MB. The compose file caps it at 128 MB and half a CPU.
 You don't need the script. It automates these steps (run in `/opt/bwheater`):
 
 ```bash
-cp .env.example .env && chmod 600 .env        # then edit .env: at least one alert channel (see .env.example)
+cp .env.example .env && chmod 600 .env        # then edit .env: alert channel and credentials (see .env.example)
 docker compose build                          # about a minute the first time
-docker compose run --rm bwwatch login         # sign in once, in your browser
+docker compose run --rm bwwatch login --auto  # automated headless sign-in using credentials in .env
 docker compose run --rm bwwatch test-notify   # does a test alert reach your phone?
 docker compose run --rm bwwatch check         # read everything once and show what bwwatch understands
 docker compose up -d                          # run it, always
@@ -191,8 +193,7 @@ docker compose exec bwwatch bwwatch verify --wait 120    # did it really work?
 
 The quickest alert channel is [ntfy](https://ntfy.sh): install the ntfy app, make up a long random topic name
 (`openssl rand -hex 12`), put it in `NTFY_TOPIC=` and subscribe to that topic in the app. Telegram, email, a generic
-webhook and Home Assistant work too — all documented in [`.env.example`](.env.example). **No Wave password goes in
-`.env`.** The `login` command prints a link; sign in, and when the browser ends on an error page (that's expected:
+webhook and Home Assistant work too — all documented in [`.env.example`](.env.example). If you prefer not to store credentials in `.env`, the `login` command prints a browser link; sign in, and when the browser ends on an error page (that's expected:
 it is trying to open the phone app), open the developer tools (F12 → Network), click the failed/302 request and copy
 its **`location`** response header — it starts with `com.bradfordwhiteapps.bwconnect://oauth/redirect?...` — and paste
 it back. The code in it works once and expires within minutes. Edited `.env`? `docker compose up -d --force-recreate`
@@ -220,7 +221,7 @@ You can also set it yourself. `./bwctl call` runs one of those lines and prints 
 that works in `.env` (single quotes, because of `{` and `&`):
 
 ```
-BW_FAULT_REQUEST='GET /wave/getApplianceErrors?macAddress={mac}'
+BW_FAULT_REQUEST='GET /wave/getApplianceErrors?mac_address={mac}'
 ```
 
 Placeholders: `{account_id}` `{mac}` `{serial}` `{name}`. Then `./bwctl restart`. Existing entries are
@@ -478,11 +479,12 @@ running container, or a one-off one if the service is stopped.
 |-------------|--------------|
 | `status` | one-screen summary: service health, last poll, heater settings, faults, pending alerts, backups |
 | `faults [--limit N] [--all] [--raw]` | the logged faults, newest first: when it happened, code, whether it is active or cleared, when it cleared |
+| `energy [--view hourly|daily] [--limit N] [--element-only]` | recorded energy use: heat pump vs electric backup element (kWh) |
 | `fields [--match PATTERN]` | every field the cloud reports, its value now, how often it changed and when |
 | `changes [--hours N] [--match PATTERN] [--around "2026-10-04 13:15" [--minutes N]]` | what changed and when — most useful around the time of a fault |
 | `calls [--hours N]` | the request log: how many calls to each endpoint, how fast, and any HTTP 429 slow-downs |
 | `discover [--now] [--reset]` | the remembered `getApplianceErrors` form; `--now` tries the three forms, `--reset` forgets it |
-| `export faults\|polls\|readings [--out FILE]` | CSV, e.g. for a warranty claim: `./bwctl export faults > faults.csv` |
+| `export faults|polls|readings|energy [--out FILE]` | CSV, e.g. for a warranty claim: `./bwctl export faults > faults.csv` |
 | `check` | read everything once and show what bwwatch understands (writes nothing) |
 | `login` | sign in again (needed if you get the *"sign-in needs attention"* alert) |
 | `call "<request>" [--mac MAC]` | one read-only request, answer printed — to try a request before putting it in `.env` |
@@ -497,7 +499,7 @@ running container, or a one-off one if the service is stopped.
 
 Under the hood these are the container's own commands — `docker compose exec bwwatch bwwatch <command>` — which are:
 `run`, `login`, `check`, `call`, `probe`, `status`, `faults`, `export`, `backup`, `dbcheck`, `test-notify`, `verify`,
-`fields`, `changes`, `calls`, `discover`,
+`fields`, `changes`, `calls`, `discover`, `energy`,
 `setup` (the guided setup wizard; `install.sh` runs it for you), `healthcheck` (exit 0 if the service is alive; Docker
 uses it) and `version`.
 

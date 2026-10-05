@@ -210,12 +210,12 @@ class RuntimeNeverWrites(WaveTestCase):
         self.mock.status[MAC]["mode"] = "Electric"
         svc.cycle()
         self.assertEqual(self.mock.writes, [])
-        allowed = {"/auth/token", "/wave/getApplianceList", "/wave/getApplianceStatus", "/wave/getNotifications", "/ntfy"}
+        allowed = {"/auth/token", "/wave/getApplianceList", "/wave/getApplianceStatus", "/wave/getNotifications", "/ntfy", "/wave/getEnergyUsage"}
         self.assertLessEqual({r["path"] for r in self.mock.requests}, allowed)
         self.assertTrue(all(r["method"] in ("GET", "POST") for r in self.mock.requests))
-        # POSTs may only be the sign-in refresh and our own alerts
+        # POSTs may only be the sign-in refresh, our own alerts, and read-only getEnergyUsage telemetry
         posts = {r["path"] for r in self.mock.requests if r["method"] == "POST"}
-        self.assertLessEqual(posts, {"/auth/token", "/ntfy"})
+        self.assertLessEqual(posts, {"/auth/token", "/ntfy", "/wave/getEnergyUsage"})
 
 
 if __name__ == "__main__":

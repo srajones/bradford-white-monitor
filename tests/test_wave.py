@@ -118,6 +118,33 @@ class SignIn(WaveTestCase):
         # and on the next start the (stale) .env value is NOT used again
         TokenManager(cfg, store).bearer()
 
+    def test_login_with_credentials_saves_refresh_token(self):
+        cfg = self.cfg(BW_USERNAME="user@example.com", BW_PASSWORD="mypassword")
+        store = TokenStore(cfg.data_dir / "token.json")
+        tm = TokenManager(cfg, store)
+        tm.login_with_credentials()
+        saved = store.load()
+        self.assertIsNotNone(saved)
+        self.assertTrue(saved["refresh_token"].startswith("refresh-token-"))
+        self.assertEqual(tm.account_id, self.mock.oid)
+
+    def test_login_with_credentials_rejects_invalid_password(self):
+        cfg = self.cfg(BW_USERNAME="user@example.com", BW_PASSWORD="wrong")
+        store = TokenStore(cfg.data_dir / "token.json")
+        tm = TokenManager(cfg, store)
+        with self.assertRaises(AuthError) as ctx:
+            tm.login_with_credentials()
+        self.assertIn("invalid credentials", str(ctx.exception))
+
+    def test_login_with_credentials_auto_signs_in_on_first_poll(self):
+        cfg = self.cfg(BW_USERNAME="user@example.com", BW_PASSWORD="mypassword")
+        store = TokenStore(cfg.data_dir / "token.json")
+        tm = TokenManager(cfg, store)
+        self.assertTrue(tm.has_credentials())
+        bearer = tm.bearer()
+        self.assertIsNotNone(bearer)
+        self.assertIsNotNone(store.load())
+
     def test_no_credentials_is_a_clear_auth_error(self):
         cfg = self.cfg()
         with self.assertRaises(AuthError) as ctx:
