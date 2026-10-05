@@ -70,10 +70,11 @@ in_service() {
   fi
 }
 
-cmd=${1:-help}
+cmd=${1:-menu}
 [ $# -gt 0 ] && shift
 
 case $cmd in
+  menu|cheat)     exec "$DIR/bwcheat" "$@" ;;
   help|-h|--help) usage ;;
   reconfigure)    exec "$DIR/install.sh" --reconfigure ;;
   uninstall)      exec "$DIR/install.sh" --uninstall ;;

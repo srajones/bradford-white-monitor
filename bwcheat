@@ -1,0 +1,77 @@
+#!/bin/sh
+# bwcheat: Interactive menu and quick command runner for Bradford White watcher
+
+# find the real folder even when reached through a symbolic link
+_self=$0
+while [ -h "$_self" ]; do
+  _dir=$(cd "$(dirname "$_self")" && pwd -P)
+  _link=$(readlink "$_self")
+  case $_link in
+    /*) _self=$_link ;;
+    *)  _self=$_dir/$_link ;;
+  esac
+done
+DIR=$(cd "$(dirname "$_self")" 2>/dev/null && pwd -P) || DIR="/opt/bwheater"
+BWCTL="$DIR/bwctl"
+
+run_cmd() {
+  case "$1" in
+    1)  "$BWCTL" status ;;
+    2)  "$BWCTL" readings ;;
+    3)  "$BWCTL" faults ;;
+    4)  "$BWCTL" energy ;;
+    5)  "$BWCTL" changes ;;
+    6)  "$BWCTL" poll ;;
+    7)  "$BWCTL" report ;;
+    8)  "$BWCTL" sync ;;
+    9)  "$BWCTL" test-notify --event fault ;;
+    10) "$BWCTL" logs -f ;;
+    11) "$BWCTL" restart ;;
+    12) "$BWCTL" update ;;
+    0|q|Q|exit) exit 0 ;;
+    *)  printf "Invalid selection: %s\n" "$1"; return 1 ;;
+  esac
+}
+
+# If a number or command was passed as an argument, run it directly
+if [ $# -gt 0 ]; then
+  run_cmd "$1"
+  exit $?
+fi
+
+# Otherwise, show the interactive numbered menu
+while true; do
+  printf '\n'
+  printf '========================================================================\n'
+  printf '             BRADFORD WHITE WATER HEATER WATCHER MENU\n'
+  printf '========================================================================\n'
+  printf '  1) Status Summary       (Health, last check time, mode, setpoint)\n'
+  printf '  2) Live Readings        (Table of tank modes & setpoint temps)\n'
+  printf '  3) Fault History        (Table of all active & past fault codes)\n'
+  printf '  4) Energy Usage         (Heat pump vs electric backup kWh)\n'
+  printf '  5) Recent Changes       (Sensors and settings that changed)\n'
+  printf '  6) Trigger Manual Poll  (Poll now & log directly to database)\n'
+  printf '  7) Generate Report      (Create Markdown report & CSV files)\n'
+  printf '  8) Sync to Dropbox      (Export fresh report & sync to Dropbox)\n'
+  printf '  9) Test Notifications  (Send test alert to phone / Home Assistant)\n'
+  printf ' 10) View Live Logs       (Follow real-time service logs, Ctrl+C exits)\n'
+  printf ' 11) Restart Watcher      (Restart container & re-read .env)\n'
+  printf ' 12) Update Watcher       (Rebuild & update container with latest code)\n'
+  printf '  0) Exit\n'
+  printf '========================================================================\n'
+  printf 'Select an option [0-12]: '
+  read -r choice || break
+  case "$choice" in
+    0|q|Q|exit) break ;;
+    [1-9]|10|11|12)
+      printf '\n'
+      run_cmd "$choice"
+      printf '\nPress Enter to return to menu...'
+      read -r _dummy
+      ;;
+    *)
+      printf '\nInvalid choice. Please pick a number from 0 to 12.\n'
+      sleep 1
+      ;;
+  esac
+done
