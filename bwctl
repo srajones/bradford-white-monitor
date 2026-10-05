@@ -91,10 +91,13 @@ case $cmd in
     if ! command -v rclone >/dev/null 2>&1; then
       die "rclone is not installed. Install it on your VPS with: curl https://rclone.org/install.sh | sudo bash"
     fi
+    mkdir -p "$DIR/data/backups" "$DIR/data/exports"
+    printf 'Generating fresh report & CSV exports...\n'
+    in_service report
     printf 'Syncing bwwatch backups and reports to Dropbox...\n'
     rclone copy "$DIR/data/backups/" dropbox:WaterHeater/backups/
     rclone copy "$DIR/data/exports/" dropbox:WaterHeater/reports/
-    printf 'Sync complete.\n'
+    printf 'Sync complete. Check your Dropbox under WaterHeater/\n'
     ;;
   *)              need_ready; in_service "$cmd" "$@" ;;
 esac
