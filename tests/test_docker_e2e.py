@@ -120,6 +120,8 @@ class RealInstall(unittest.TestCase):
         cls.docker_before = docker_objects()
         cls.addClassCleanup(cls.mock.stop)
         cls.login_code = cls.mock.issue_login_code("e2e-login-code-" + "a" * 24)
+        # the entry from the Wave app's Notifications tab, as the app words it: a fault that cleared by itself
+        cls.mock.notifications = {"notifications": [{"title": "Fault 10", "message": "(Cleared) Superheat Fault", "timestamp": 1791134100}]}
         # What a person would have typed into .env if their servers lived elsewhere: the wizard keeps these.
         # (the last line is an awkward value - quotes, a dollar sign, a # - to prove it survives Compose's .env rules)
         (cls.dir / ".env").write_text(
@@ -201,6 +203,8 @@ class RealInstall(unittest.TestCase):
         self.assertEqual(status, 0, text[-3000:])
         self.assertIn("bwwatch listens on no port", text)
         self.assertIn("The container publishes no port", text)
+        self.assertIn("Superheat Fault", text, "the wizard showed what it found in the Notifications list")
+        self.assertIn("cleared", text)
         for part in ("Part 1 of 4", "Part 2 of 4", "Part 3 of 4", "Part 4 of 4"):
             self.assertIn(part, text)
         self.assertIn("Built the image bwwatch:local", text)
@@ -288,6 +292,16 @@ class RealInstall(unittest.TestCase):
         done = self.ctl("status")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("Basement", done.stdout)
+
+        done = self.ctl("faults")  # the "(Cleared)" fault from the screenshot: logged as history, not alarmed about
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertRegex(done.stdout, r"10\s+cleared\s+Superheat Fault")
+        self.assertIn("pre-existing", done.stdout)
+        self.assertIn("2026-10-04 12:15 CDT", done.stdout, "the time the app gave (17:15 UTC), in the time zone chosen in the setup")
+        self.assertIn("already cleared when first seen", done.stdout)
+        self.assertFalse(any("fault 10" in m["json"]["title"].lower() for m in self.mock.sinks["ntfy"]), "no alarm for old history")
+        self.assertTrue(any("Superheat Fault" in m["json"]["message"] and "[cleared]" in m["json"]["message"]
+                            for m in self.mock.sinks["ntfy"]), "but the first message lists it")
 
         done = self.ctl("export", "faults")  # piped: Docker's terminal mode would corrupt this with \r\n
         self.assertEqual(done.returncode, 0, done.stderr)

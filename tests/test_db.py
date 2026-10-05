@@ -27,6 +27,60 @@ class Base(unittest.TestCase):
         conn.execute("INSERT INTO polls(started_at, finished_at, ok) VALUES(?, ?, 1)", ("2026-01-01T00:00:%02dZ" % n, "2026-01-01T00:00:%02dZ" % n))
 
 
+class Migration(Base):
+    V1_FAULTS = """CREATE TABLE faults(
+        id INTEGER PRIMARY KEY, mac TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('event', 'state', 'blob')),
+        source TEXT NOT NULL, fingerprint TEXT NOT NULL, code TEXT, description TEXT, occurred_at TEXT,
+        first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, cleared_at TEXT, seen_count INTEGER NOT NULL DEFAULT 1,
+        baseline INTEGER NOT NULL DEFAULT 0 CHECK (baseline IN (0, 1)), raw TEXT NOT NULL)"""
+
+    def make_v1(self):
+        path = self.dir / db.DB_NAME
+        conn = sqlite3.connect(str(path))
+        conn.execute(self.V1_FAULTS)
+        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID")
+        conn.execute("INSERT INTO faults(mac, kind, source, fingerprint, code, first_seen_at, last_seen_at, raw) "
+                     "VALUES('AA', 'event', 'fault_history', 'code=10|at=1', '10', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}')")
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+        conn.close()
+
+    def test_a_version_1_database_gains_the_state_columns_and_keeps_its_rows(self):
+        self.make_v1()
+        conn, recovery = self.open()
+        self.assertIsNone(recovery)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(faults)")}
+        self.assertTrue({"state", "cleared_seen_at"} <= columns)
+        row = conn.execute("SELECT code, state, cleared_seen_at FROM faults").fetchone()
+        self.assertEqual((row["code"], row["state"], row["cleared_seen_at"]), ("10", None, None), "old entries: state unknown")
+        conn.execute("UPDATE faults SET state = 'cleared'")  # and the new column works
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("UPDATE faults SET state = 'nonsense'")
+
+    def test_a_new_database_has_them_from_the_start(self):
+        conn, _ = self.open()
+        self.assertTrue({"state", "cleared_seen_at"} <= {r[1] for r in conn.execute("PRAGMA table_info(faults)")})
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_the_migration_is_all_or_nothing(self):
+        self.make_v1()
+        raw = sqlite3.connect(str(self.dir / db.DB_NAME))
+        raw.execute("ALTER TABLE faults ADD COLUMN state TEXT")  # a half-applied earlier attempt: the next ALTER must fail
+        raw.commit()
+        raw.close()
+        conn = db.connect(self.dir / db.DB_NAME)
+        self.addCleanup(conn.close)
+        with self.assertRaises(sqlite3.OperationalError):
+            db.init_schema(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1, "still version 1: nothing half-done is recorded")
+
+    def test_a_backup_of_the_old_version_is_migrated_when_restored(self):
+        self.make_v1()
+        conn, _ = self.open()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM faults").fetchone()[0], 1)
+
+
 class Settings(Base):
     def test_durability_settings(self):
         conn, recovery = self.open()

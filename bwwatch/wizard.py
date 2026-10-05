@@ -703,7 +703,8 @@ class Wizard:
             return None
         self.c.say("It answered with %d entr%s (list found at: %s)." % (len(events), "y" if len(events) == 1 else "ies", where), "ok")
         for event in events[:3]:
-            bits = ["code %s" % event.code if event.code else None, event.description, local_time(event.occurred_at, cfg.display_tz) if event.occurred_at else None]
+            bits = ["code %s" % event.code if event.code else None, event.description, local_time(event.occurred_at, cfg.display_tz) if event.occurred_at else None,
+                    {"cleared": "cleared", "active": "ACTIVE NOW"}.get(event.state or "")]
             self.c.say("    - " + " | ".join(b for b in bits if b))
         return True
 

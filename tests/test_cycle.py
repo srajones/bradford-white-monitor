@@ -1,6 +1,7 @@
 """What a poll does: baseline, new faults, dedupe, settings changes, flags, failures, retries, atomicity."""
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 import unittest
@@ -39,6 +40,223 @@ class CycleCase(WaveTestCase):
     def poll(self):
         outcome = self.svc.cycle()
         return outcome
+
+
+UUID = "9f1c2a3e-1111-2222-3333-444455556666"
+
+
+def wave_entry(minute, state="", code=10, text="Superheat Fault", **extra):
+    """An entry the way the Wave app words it: title 'Fault 10', '(Cleared) ' in front of the text once it has cleared."""
+    marker = "(Cleared) " if state == "cleared" else ""
+    entry = {"title": "Fault %s" % code, "message": marker + text, "timestamp": T0 + minute * 60}
+    if state == "active":
+        entry["status"] = "Active"
+    entry.update(extra)
+    return entry
+
+
+class ClearedFaults(CycleCase):
+    """Faults come and go by themselves; the Notifications list remembers them as '(Cleared)'."""
+
+    def faults(self, **where):
+        rows = self.svc.conn.execute("SELECT * FROM faults WHERE kind = 'event' ORDER BY id").fetchall()
+        return [r for r in rows if all(r[k] == v for k, v in where.items())]
+
+    def feed(self, *entries):
+        self.mock.notifications = {"notifications": list(entries)}
+        return self.poll()
+
+    def test_the_entry_in_the_screenshot_is_logged_but_does_not_raise_an_alarm_when_it_is_already_history(self):
+        out = self.feed(wave_entry(0, "cleared"))
+        self.assertEqual(out.new_faults, [])
+        (row,) = self.faults()
+        self.assertEqual((row["code"], row["description"], row["state"], row["baseline"]), ("10", "Superheat Fault", "cleared", 1))
+        self.assertEqual(self.kinds(), ["info"])
+        self.assertIn("code 10", self.delivered()[0]["message"])
+        self.assertIn("[cleared]", self.delivered()[0]["message"])
+
+    def test_a_fault_that_came_and_went_between_two_checks_is_still_reported(self):
+        self.feed()
+        out = self.feed(wave_entry(0, "cleared"))
+        self.assertEqual(len(out.new_faults), 1)
+        alert = self.delivered()[-1]
+        self.assertEqual(alert["title"], "Water heater fault 10 (cleared) — Basement")
+        self.assertIn("Status: cleared", alert["message"])
+        self.assertIn("already cleared", alert["message"])
+        self.assertEqual(alert["priority"], 4, "still a fault worth knowing about")
+        (row,) = self.faults()
+        self.assertEqual((row["state"], row["baseline"]), ("cleared", 0))
+        self.assertIsNone(row["cleared_seen_at"], "we never saw it active, so we did not see it clear")
+        sent = len(self.delivered())
+        self.feed(wave_entry(0, "cleared"))
+        self.assertEqual(len(self.delivered()), sent, "and only once")
+
+    def test_active_then_cleared_alerts_twice_with_the_duration(self):
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 — Basement")
+        self.assertIn("Status: active", self.delivered()[-1]["message"])
+        out = self.feed(wave_entry(0, "cleared", clearedAt=T0 + 42 * 60))
+        self.assertEqual(out.new_faults, [])
+        self.assertEqual(out.cleared, 1)
+        alert = self.delivered()[-1]
+        self.assertEqual(alert["title"], "Water heater fault 10 cleared — Basement")
+        self.assertIn("It lasted about 42 minutes.", alert["message"])
+        for text in ("Began:", "Cleared:", "Noticed:", "Superheat Fault"):
+            self.assertIn(text, alert["message"])
+        self.assertEqual(self.kinds()[-1], "cleared")
+        (row,) = self.faults()
+        self.assertEqual(row["state"], "cleared")
+        self.assertTrue(row["cleared_at"].startswith("20"), "the time the entry gave")
+        self.assertTrue(row["cleared_seen_at"], "and the check on which we saw it clear")
+        sent = len(self.delivered())
+        self.feed(wave_entry(0, "cleared", clearedAt=T0 + 42 * 60))
+        self.assertEqual(len(self.delivered()), sent)
+
+    def test_the_log_says_how_each_cleared_fault_was_learned_about(self):
+        import argparse
+        import contextlib
+        import io
+
+        from bwwatch import cli
+
+        self.feed()
+        self.feed(wave_entry(0, "cleared"))                    # already gone when first seen
+        self.feed(wave_entry(0, "cleared"), wave_entry(200, "active", code=12, text="Sensor"))
+        self.feed(wave_entry(0, "cleared"), wave_entry(200, "cleared", code=12, text="Sensor"))  # seen active, then cleared
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.cmd_faults(self.svc.cfg, argparse.Namespace(limit=20, all=False, raw=False))
+        lines = {re.split(r"\s{2,}", l.strip())[2]: l for l in out.getvalue().splitlines()[2:]}
+        self.assertIn("already cleared when first seen", lines["10"])
+        self.assertIn("cleared by 20", lines["12"])
+
+    def test_without_a_time_it_says_it_cleared_between_two_checks(self):
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        self.feed(wave_entry(0, "cleared"))
+        message = self.delivered()[-1]["message"]
+        self.assertIn("Cleared: some time between", message)
+        self.assertNotIn("It lasted", message)
+
+    def test_clear_alerts_can_be_turned_off_but_the_clear_is_still_logged(self):
+        self.svc = self.service(self.cfg(NOTIFY_CLEARED="false"))
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        sent = len(self.delivered())
+        self.feed(wave_entry(0, "cleared"))
+        self.assertEqual(len(self.delivered()), sent)
+        self.assertEqual(self.faults()[0]["state"], "cleared")
+
+    def test_a_fault_that_is_active_right_now_is_news_even_on_the_very_first_poll(self):
+        out = self.feed(wave_entry(0, "cleared", code=11), wave_entry(5, "active"))
+        self.assertEqual([f.code for f in out.new_faults], ["10"], "the old cleared one is history, the active one is not")
+        titles = self.titles()
+        self.assertIn("Water heater fault 10 — Basement", titles)
+        self.assertEqual(self.faults(code="11")[0]["baseline"], 1)
+        self.assertEqual(self.faults(code="10")[0]["baseline"], 0)
+
+    def test_an_active_fault_found_at_the_start_is_reported_as_cleared_later(self):
+        self.feed(wave_entry(0, "active"))
+        self.feed(wave_entry(0, "cleared", clearedAt=T0 + 600))
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 cleared — Basement")
+
+    def test_a_fault_that_comes_back_alerts_again(self):
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        self.feed(wave_entry(0, "cleared"))
+        out = self.feed(wave_entry(0, "active"))
+        self.assertEqual(len(out.new_faults), 1)
+        alert = self.delivered()[-1]
+        self.assertEqual(alert["title"], "Water heater fault 10 (active again) — Basement")
+        self.assertIn("ACTIVE again", alert["message"])
+        self.assertEqual(self.faults()[0]["state"], "active")
+        self.assertEqual(self.count("faults"), 1, "the same row, not a second one")
+
+    def test_entries_that_never_say_anything_behave_exactly_as_before(self):
+        self.feed()
+        self.feed(event(7))
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 — Basement")
+        self.assertIsNone(self.faults()[0]["state"])
+        sent = len(self.delivered())
+        self.feed(event(7))
+        self.assertEqual(len(self.delivered()), sent)
+
+    def test_a_rewritten_entry_is_the_same_fault_not_two(self):
+        # no unique id, and Wave gives the entry a new time when it clears: its identity changes, the fault does not
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        faults_before = len(self.delivered())
+        out = self.feed(wave_entry(50, "cleared"))
+        self.assertEqual(out.new_faults, [], "no second fault alert")
+        self.assertEqual(self.count("faults", "WHERE kind = 'event'"), 1, "one row, re-keyed")
+        self.assertEqual(self.faults()[0]["state"], "cleared")
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 cleared — Basement")
+        self.assertEqual(len(self.delivered()), faults_before + 1)
+        sent = len(self.delivered())
+        self.feed(wave_entry(50, "cleared"))
+        self.assertEqual(len(self.delivered()), sent, "and the re-keyed row is recognised afterwards")
+
+    def test_an_active_entry_that_is_still_listed_is_never_merged_with_another(self):
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        out = self.feed(wave_entry(0, "active"), wave_entry(60, "cleared"))
+        self.assertEqual(len(out.new_faults), 1, "a second occurrence that already cleared")
+        states = sorted((r["occurred_at"], r["state"]) for r in self.faults())
+        self.assertEqual([s for _, s in states], ["active", "cleared"])
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 (cleared) — Basement")
+
+    def test_a_different_code_is_never_merged(self):
+        self.feed()
+        self.feed(wave_entry(0, "active", code=10))
+        out = self.feed(wave_entry(50, "cleared", code=11, text="Other"))
+        self.assertEqual([f.code for f in out.new_faults], ["11"])
+        self.assertEqual(self.faults(code="10")[0]["state"], "active")
+
+    def test_a_unique_id_survives_the_rewrite_without_any_merging(self):
+        self.feed()
+        self.feed(wave_entry(0, "active", id=UUID))
+        out = self.feed(wave_entry(55, "cleared", id=UUID, clearedAt=T0 + 55 * 60))
+        self.assertEqual(out.new_faults, [])
+        self.assertEqual(self.count("faults", "WHERE kind = 'event'"), 1)
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 cleared — Basement")
+
+    def test_a_recurrence_after_it_cleared_is_a_new_fault(self):
+        self.feed()
+        self.feed(wave_entry(0, "cleared"))
+        out = self.feed(wave_entry(0, "cleared"), wave_entry(300, "active"))
+        self.assertEqual(len(out.new_faults), 1)
+        self.assertEqual(self.count("faults", "WHERE kind = 'event'"), 2)
+
+    def test_the_log_commands_show_what_happened(self):
+        import argparse
+        import contextlib
+        import io
+
+        from bwwatch import cli
+
+        self.feed()
+        self.feed(wave_entry(0, "active"))
+        self.feed(wave_entry(0, "cleared", clearedAt=T0 + 42 * 60))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.cmd_faults(self.svc.cfg, argparse.Namespace(limit=20, all=False, raw=False))
+            cli.cmd_status(self.svc.cfg, argparse.Namespace())
+        text = out.getvalue()
+        for expected in ("OCCURRED", "STATE", "cleared", "Superheat Fault", "Active fault entries: none"):
+            self.assertIn(expected, text)
+        self.assertIn("cleared 20", text, "the time the entry itself gave for clearing")
+        self.feed(wave_entry(0, "cleared", clearedAt=T0 + 42 * 60), wave_entry(500, "active", code=12, text="Sensor"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.cmd_status(self.svc.cfg, argparse.Namespace())
+        self.assertIn("Active fault entries: code 12 Sensor", out.getvalue())
+        csv_out = io.StringIO()
+        with contextlib.redirect_stdout(csv_out):
+            cli.cmd_export(self.svc.cfg, argparse.Namespace(table="faults", out=None))
+        header = csv_out.getvalue().splitlines()[0].split(",")
+        for column in ("state", "cleared_at", "cleared_seen_at", "occurred_at"):
+            self.assertIn(column, header)
 
 
 class Baseline(CycleCase):

@@ -113,7 +113,105 @@ class Normalize(unittest.TestCase):
     def test_extract_dedupes_and_filters(self):
         payload = {"notifications": [{"id": 1, "msg": "fault 10"}, {"id": 1, "msg": "fault 10"}, {"id": 2, "msg": "software update"}]}
         events, _ = extract_events(payload, FaultOptions(match=re.compile("fault"), volatile=VOLATILE))
-        self.assertEqual([e.fingerprint for e in events], ["id=1"])
+        self.assertEqual([e.fingerprint for e in events], ["id=1|code=10"], "the code is read from the wording too")
+
+
+class Cleared(unittest.TestCase):
+    """The Wave app lists a fault as "Fault 10 / (Cleared) Superheat Fault"; these are the ways the data may say so."""
+
+    def one(self, item, **opts):
+        events, _ = extract_events([item], FaultOptions(volatile=VOLATILE, **opts))
+        self.assertEqual(len(events), 1)
+        return events[0]
+
+    def test_the_apps_own_wording_is_understood(self):
+        ev = self.one({"title": "Fault 10", "message": "(Cleared) Superheat Fault", "timestamp": "2026-10-04T17:15:00Z"})
+        self.assertEqual((ev.code, ev.description, ev.state), ("10", "Superheat Fault", "cleared"))
+        self.assertEqual(ev.occurred_at, "2026-10-04T17:15:00Z")
+        self.assertEqual(ev.fingerprint, "code=10|at=2026-10-04T17:15:00Z")
+        self.assertIn("(Cleared) Superheat Fault", ev.raw, "the raw entry is kept exactly as it came")
+
+    def test_the_marker_in_other_forms(self):
+        for text in ("(Cleared) Superheat Fault", "[Resolved] Superheat Fault", "Cleared - Superheat Fault",
+                     "CLEARED: Superheat Fault", "(cleared)Superheat Fault"):
+            with self.subTest(text):
+                ev = self.one({"faultCode": 10, "description": text})
+                self.assertEqual((ev.state, ev.description), ("cleared", "Superheat Fault"))
+
+    def test_status_words_flags_and_end_times(self):
+        cleared = [
+            {"status": "CLEARED"}, {"state": "Resolved"}, {"alertStatus": "recovered"}, {"isCleared": True},
+            {"cleared": "yes"}, {"active": False}, {"isActive": "false"}, {"clearedAt": "2026-10-04T17:45:00Z"},
+            {"resolvedTime": 1760000000}, {"endTime": "2026-10-04T17:45:00Z"},
+        ]
+        active = [{"status": "Active"}, {"state": "OPEN"}, {"isActive": True}, {"cleared": False}, {"resolved": 0}, {"status": "unresolved"}]
+        unknown = [{}, {"status": "unread"}, {"read": True}, {"endTime": None}, {"endTime": ""}, {"clearedAt": 0}, {"status": "ok"}]
+        for extra in cleared:
+            with self.subTest(cleared=extra):
+                self.assertEqual(self.one(dict({"faultCode": 10, "description": "x"}, **extra)).state, "cleared")
+        for extra in active:
+            with self.subTest(active=extra):
+                self.assertEqual(self.one(dict({"faultCode": 10, "description": "x"}, **extra)).state, "active")
+        for extra in unknown:
+            with self.subTest(unknown=extra):
+                self.assertIsNone(self.one(dict({"faultCode": 10, "description": "x"}, **extra)).state, "no explicit evidence: no guess")
+
+    def test_cleared_wins_over_a_stale_active_hint(self):
+        ev = self.one({"faultCode": 10, "description": "(Cleared) Superheat", "status": "Active"})
+        self.assertEqual(ev.state, "cleared")
+
+    def test_the_time_it_cleared_is_kept_when_given(self):
+        ev = self.one({"faultCode": 10, "description": "x", "time": "2026-10-04T17:15:00Z", "clearedAt": "2026-10-04T17:45:00Z"})
+        self.assertEqual((ev.state, ev.cleared_at), ("cleared", "2026-10-04T17:45:00Z"))
+        ev = self.one({"faultCode": 10, "description": "x", "clearedAt": 1760000000})
+        self.assertEqual(ev.cleared_at, coerce_time(1760000000))
+        self.assertIsNone(self.one({"faultCode": 10, "description": "(Cleared) x"}).cleared_at, "a marker alone gives no time")
+
+    def test_an_entry_that_says_nothing_has_no_state(self):
+        ev = self.one({"faultCode": 10, "description": "Superheat Fault", "timestamp": 1760000000})
+        self.assertIsNone(ev.state)
+
+    def test_the_code_is_read_from_the_wording_when_there_is_no_code_field(self):
+        for text, code in (("Fault 10", "10"), ("fault #7", "7"), ("Fault Code 12", "12"), ("Error: 44", "44"), ("ALARM 3", "3")):
+            with self.subTest(text):
+                self.assertEqual(self.one({"title": text, "timestamp": 1760000000}).code, code)
+        self.assertIsNone(self.one({"title": "Vacation mode ends tomorrow", "timestamp": 1760000000}).code)
+        self.assertEqual(self.one({"title": "Fault 10", "faultCode": 77}).code, "77", "an explicit field wins")
+        self.assertIsNone(self.one({"title": "Fault 10"}, code_field="nosuchfield").code, "a chosen field is used alone")
+
+    def test_fault_n_alone_is_not_repeated_in_the_description(self):
+        self.assertEqual(self.one({"title": "Fault 10", "message": "Superheat Fault"}).description, "Superheat Fault")
+        self.assertEqual(self.one({"title": "Fault 10"}).description, "Fault 10", "kept when it is all there is")
+
+    def test_the_identity_does_not_depend_on_the_state(self):
+        active = self.one({"title": "Fault 10", "message": "Superheat Fault", "timestamp": 1760000000})
+        cleared = self.one({"title": "Fault 10", "message": "(Cleared) Superheat Fault", "timestamp": 1760000000})
+        self.assertEqual(active.fingerprint, cleared.fingerprint)
+        self.assertNotEqual(active.state, cleared.state)
+
+    def test_unique_looking_ids_identify_an_entry_on_their_own(self):
+        uuid = "9f1c2a3e-1111-2222-3333-444455556666"
+        a = self.one({"id": uuid, "faultCode": 10, "timestamp": 1760000000})
+        b = self.one({"id": uuid, "faultCode": 10, "timestamp": 1760009999, "status": "Cleared"})
+        self.assertEqual(a.fingerprint, b.fingerprint, "same entry even if the time was rewritten")
+        self.assertEqual(a.fingerprint, "id:" + uuid)
+        self.assertEqual(self.one({"id": 1234567, "faultCode": 10, "timestamp": 1}).fingerprint, "id:1234567")
+        self.assertEqual(self.one({"id": "a1b2c3d4e5f60718", "faultCode": 10}).fingerprint, "id:a1b2c3d4e5f60718")
+
+    def test_short_or_derived_ids_are_never_trusted_alone(self):
+        for ident in (1, 7, 12345, "3", "fault-10", "abc", "notification"):
+            with self.subTest(ident):
+                fp = self.one({"id": ident, "faultCode": 10, "timestamp": 1760000000}).fingerprint
+                self.assertIn("code=10", fp)
+                self.assertIn("at=", fp)
+
+    def test_looks_unique(self):
+        from bwwatch.faults import looks_unique
+
+        for good in ("9f1c2a3e-1111-2222-3333-444455556666", "123456", "1760000000123", "a1b2c3d4e5f60718", "Nx7Kq2Lm9Pz4Rt8Vw1"):
+            self.assertTrue(looks_unique(good), good)
+        for bad in (None, "", 0, 5, "12345", "fault-10", "abcdefghijklmnop", "short1", "1234567890 abcdef"):
+            self.assertFalse(looks_unique(bad), bad)
 
 
 class Digest(unittest.TestCase):

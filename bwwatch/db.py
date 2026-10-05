@@ -30,7 +30,7 @@ from .util import fsync_dir, iso, utcnow
 log = logging.getLogger("bwwatch.db")
 
 DB_NAME = "bwwatch.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA: Tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS meta(
@@ -79,6 +79,9 @@ SCHEMA: Tuple[str, ...] = (
     # One row per fault. kind: event = an entry in the fault/notification history,
     # state = a fault flag seen in the status payload (open until it clears),
     # blob = a fault response we could not break into entries.
+    # For an event, `state` says whether the entry is active or has cleared (NULL = it does not say), `cleared_at`
+    # is the time the entry itself gives for that, and `cleared_seen_at` is when bwwatch saw an entry it had known as
+    # active turn cleared (NULL for one that was already cleared the first time it was seen).
     """CREATE TABLE IF NOT EXISTS faults(
         id            INTEGER PRIMARY KEY,
         mac           TEXT NOT NULL,
@@ -91,6 +94,8 @@ SCHEMA: Tuple[str, ...] = (
         first_seen_at TEXT NOT NULL,
         last_seen_at  TEXT NOT NULL,
         cleared_at    TEXT,
+        state         TEXT CHECK (state IN ('active', 'cleared')),
+        cleared_seen_at TEXT,
         seen_count    INTEGER NOT NULL DEFAULT 1,
         baseline      INTEGER NOT NULL DEFAULT 0 CHECK (baseline IN (0, 1)),
         raw           TEXT NOT NULL
@@ -183,6 +188,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
             % (version, SCHEMA_VERSION)
         )
     if version == SCHEMA_VERSION:
+        return
+    if version == 1:  # 1 -> 2: events know whether they are active or cleared
+        with tx(conn):
+            conn.execute("ALTER TABLE faults ADD COLUMN state TEXT CHECK (state IN ('active', 'cleared'))")
+            conn.execute("ALTER TABLE faults ADD COLUMN cleared_seen_at TEXT")
+            conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         return
     with tx(conn):
         for statement in SCHEMA:

@@ -320,6 +320,10 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
             print(line)
         opened = conn.execute("SELECT * FROM faults WHERE kind = 'state' AND cleared_at IS NULL").fetchall()
         print("\nFault-like fields active now: %s" % (", ".join("%s=%s" % (r["description"], r["code"]) for r in opened) or "none"))
+        active = conn.execute("SELECT * FROM faults WHERE kind = 'event' AND state = 'active' ORDER BY first_seen_at").fetchall()
+        print("Active fault entries: %s" % ("; ".join(
+            "code %s %s (since %s)" % (r["code"] or "-", truncate(r["description"] or "", 40), local_time(r["occurred_at"] or r["first_seen_at"], cfg.display_tz))
+            for r in active) or "none"))
         total, new = conn.execute("SELECT COUNT(*), COALESCE(SUM(1 - baseline), 0) FROM faults").fetchone()
         print("Faults logged:   %d (%d seen since monitoring began, %d pre-existing)" % (total, new, total - new))
         latest = conn.execute("SELECT * FROM faults WHERE baseline = 0 ORDER BY id DESC LIMIT 3").fetchall()
@@ -345,26 +349,41 @@ def cmd_faults(cfg: Config, args: argparse.Namespace) -> int:
             """SELECT f.*, a.name AS appliance,
                       (SELECT o.status FROM outbox o WHERE o.fault_id = f.id ORDER BY o.id DESC LIMIT 1) AS alert
                FROM faults f LEFT JOIN appliances a ON a.mac = f.mac
-               ORDER BY f.first_seen_at DESC, f.id DESC LIMIT ?""",
+               ORDER BY COALESCE(f.occurred_at, f.first_seen_at) DESC, f.id DESC LIMIT ?""",
             (limit,),
         ).fetchall()
         if not rows:
             print("No faults logged yet.")
             return 0
+        several = len({r["mac"] for r in rows}) > 1
         table = []
         for r in rows:
-            flags = []
+            if r["kind"] == "state":  # a fault-like flag in the status data: open until it goes away
+                state = "cleared" if r["cleared_at"] else "ACTIVE"
+            else:
+                state = r["state"] or "-"
+            notes = []
             if r["baseline"]:
-                flags.append("pre-existing")
-            if r["kind"] == "state":
-                flags.append("cleared " + local_time(r["cleared_at"], cfg.display_tz) if r["cleared_at"] else "ACTIVE")
+                notes.append("pre-existing")
+            if r["occurred_at"]:
+                notes.append("noticed " + local_time(r["first_seen_at"], cfg.display_tz))
+            if r["kind"] == "state" and r["cleared_at"]:
+                notes.append("cleared " + local_time(r["cleared_at"], cfg.display_tz))
+            elif r["state"] == "cleared":
+                if r["cleared_at"]:
+                    notes.append("cleared " + local_time(r["cleared_at"], cfg.display_tz))
+                elif r["cleared_seen_at"]:
+                    notes.append("cleared by " + local_time(r["cleared_seen_at"], cfg.display_tz))
+                else:
+                    notes.append("already cleared when first seen")
             if r["alert"] and not r["baseline"]:
-                flags.append("alert " + r["alert"])
-            table.append(
-                (r["id"], local_time(r["first_seen_at"], cfg.display_tz), r["code"] or "-", r["appliance"] or r["mac"],
-                 truncate(r["description"] or "", 60), ", ".join(flags))
-            )
-        print(_table(("ID", "FIRST SEEN", "CODE", "APPLIANCE", "DETAIL", "NOTES"), table))
+                notes.append("alert " + r["alert"])
+            row = [r["id"], local_time(r["occurred_at"] or r["first_seen_at"], cfg.display_tz), r["code"] or "-", state]
+            if several:
+                row.append(r["appliance"] or r["mac"])
+            row += [truncate(r["description"] or "", 50), ", ".join(notes)]
+            table.append(tuple(row))
+        print(_table(("ID", "OCCURRED", "CODE", "STATE") + (("APPLIANCE",) if several else ()) + ("DETAIL", "NOTES"), table))
         if args.raw:
             print()
             for r in rows:
@@ -381,7 +400,7 @@ def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
         return 1
     queries = {
         "faults": "SELECT f.id, f.first_seen_at, f.last_seen_at, f.cleared_at, a.name AS appliance, f.mac, f.kind, f.code, "
-                  "f.description, f.occurred_at, f.seen_count, f.baseline, f.source FROM faults f "
+                  "f.description, f.occurred_at, f.state, f.cleared_seen_at, f.seen_count, f.baseline, f.source FROM faults f "
                   "LEFT JOIN appliances a ON a.mac = f.mac ORDER BY f.id",
         "polls": "SELECT * FROM polls ORDER BY id",
         "readings": "SELECT r.taken_at, a.name AS appliance, r.mac, r.mode, r.mode_value, r.setpoint_f, r.temps "

@@ -130,6 +130,9 @@ class NewFault:
     description: Optional[str]
     occurred_at: Optional[str]
     note: str = ""
+    state: Optional[str] = None  # "active" / "cleared" when the entry says so
+    cleared_at: Optional[str] = None
+    again: bool = False  # an entry we had seen cleared is active again
 
 
 def _who(name: str, mac: str) -> str:
@@ -148,10 +151,11 @@ def fault_alert(cfg: Config, fault: NewFault, detected_at: str) -> Tuple[str, st
         if fault.description:
             body.insert(1, truncate(fault.description, 300))
         return title, "\n".join(body)
+    tag = " (cleared)" if fault.state == "cleared" else " (active again)" if fault.again else ""
     if fault.code:
-        title = "Water heater fault %s — %s" % (truncate(fault.code, 40), fault.name)
+        title = "Water heater fault %s%s — %s" % (truncate(fault.code, 40), tag, fault.name)
     else:
-        title = "Water heater fault alert — %s" % fault.name
+        title = "Water heater fault alert%s — %s" % (tag, fault.name)
     lines = ["Appliance: %s" % _who(fault.name, fault.mac)]
     if fault.code:
         lines.append("Fault code: %s" % fault.code)
@@ -159,9 +163,55 @@ def fault_alert(cfg: Config, fault: NewFault, detected_at: str) -> Tuple[str, st
         lines.append("Detail: %s" % truncate(fault.description, 300))
     if fault.occurred_at:
         lines.append("Reported: %s" % local_time(fault.occurred_at, cfg.display_tz))
+    if fault.state == "cleared":
+        lines.append("Status: cleared%s - it had already cleared by the time bwwatch checked."
+                     % (" at %s" % local_time(fault.cleared_at, cfg.display_tz) if fault.cleared_at else ""))
+    elif fault.again:
+        lines.append("Status: ACTIVE again - it had cleared earlier.")
+    elif fault.state == "active":
+        lines.append("Status: active")
     lines.append("Detected: %s" % local_time(detected_at, cfg.display_tz))
     if fault.note:
         lines.append(fault.note)
+    return title, "\n".join(lines)
+
+
+def _span(start: Optional[str], end: Optional[str]) -> Optional[str]:
+    """'42 minutes' / '2 h 5 min' between two of our timestamps, or None if either is missing or not a stamp."""
+    try:
+        seconds = (parse_iso(end or "") - parse_iso(start or "")).total_seconds()
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    minutes = int(round(seconds / 60.0))
+    if minutes < 1:
+        return "under a minute"
+    if minutes < 120:
+        return "%d minute%s" % (minutes, "" if minutes == 1 else "s")
+    return "%d h %02d min" % (minutes // 60, minutes % 60)
+
+
+def cleared_alert(cfg: Config, name: str, mac: str, row: sqlite3.Row, cleared_at: Optional[str], detected_at: str) -> Tuple[str, str]:
+    """The alert for a fault that was active when bwwatch last looked and has now cleared."""
+    code = row["code"]
+    title = "Water heater fault %s cleared — %s" % (truncate(code, 40), name) if code else "Water heater fault cleared — %s" % name
+    lines = ["Appliance: %s" % _who(name, mac)]
+    if code:
+        lines.append("Fault code: %s" % code)
+    if row["description"]:
+        lines.append("Detail: %s" % truncate(row["description"], 300))
+    began = row["occurred_at"] or row["first_seen_at"]
+    lines.append("Began: %s" % local_time(began, cfg.display_tz))
+    if cleared_at:
+        lines.append("Cleared: %s" % local_time(cleared_at, cfg.display_tz))
+        lasted = _span(began, cleared_at)
+        if lasted:
+            lines.append("It lasted about %s." % lasted)
+    else:
+        lines.append("Cleared: some time between %s and %s (bwwatch only notices on its checks)."
+                     % (local_time(row["last_seen_at"], cfg.display_tz), local_time(detected_at, cfg.display_tz)))
+    lines.append("Noticed: %s" % local_time(detected_at, cfg.display_tz))
     return title, "\n".join(lines)
 
 
@@ -264,7 +314,8 @@ def describe_event(ev: FaultEvent, tz: str) -> str:
     if ev.description:
         bits.append(truncate(ev.description, 80))
     text = " — ".join(bits) if bits else "entry"
-    return "%s (%s)" % (text, local_time(ev.occurred_at, tz)) if ev.occurred_at else text
+    text = "%s (%s)" % (text, local_time(ev.occurred_at, tz)) if ev.occurred_at else text
+    return text + (" [cleared]" if ev.state == "cleared" else " [ACTIVE]" if ev.state == "active" else "")
 
 
 def _baseline_history_note(events: List[FaultEvent], tz: str) -> str:
@@ -286,6 +337,61 @@ def _is_iso(text: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _apply_state_change(
+    conn: sqlite3.Connection, cfg: Config, mac: str, name: str, row: sqlite3.Row, ev: FaultEvent, now: str, outcome: Outcome
+) -> Optional[NewFault]:
+    """An entry we already know: has it cleared (or come back) since we last looked?"""
+    if ev.state is None or ev.state == row["state"]:
+        return None
+    if ev.state == "cleared":
+        conn.execute(
+            "UPDATE faults SET state = 'cleared', cleared_at = COALESCE(?, cleared_at), cleared_seen_at = ?, raw = ? WHERE id = ?",
+            (ev.cleared_at, now, ev.raw, row["id"]),
+        )
+        outcome.cleared += 1
+        if row["state"] == "active" and cfg.notify_cleared:  # we had seen it active, so this is news
+            title, body = cleared_alert(cfg, name, mac, row, ev.cleared_at, now)
+            enqueue(conn, kind="cleared", title=title, body=body, priority=3, now=now, fault_id=row["id"])
+        return None
+    # it had cleared and is active again
+    conn.execute("UPDATE faults SET state = 'active', cleared_at = NULL, cleared_seen_at = NULL, raw = ? WHERE id = ?", (ev.raw, row["id"]))
+    if row["state"] == "cleared":
+        return NewFault(row["id"], mac, name, "event", ev.code or row["code"], ev.description or row["description"],
+                        ev.occurred_at or row["occurred_at"], state="active", again=True)
+    return None
+
+
+def _merge_clearing(
+    conn: sqlite3.Connection, cfg: Config, mac: str, name: str, ev: FaultEvent, present: set, now: str, outcome: Outcome
+) -> bool:
+    """A new-looking entry that is cleared, while an active one with the same code has vanished from the list.
+
+    If Wave rewrites an entry when it clears (and gives it a new time), that is the SAME fault clearing, not a second
+    fault: the old row is updated and re-keyed rather than reporting the fault twice. An active entry that is still
+    listed is never merged (that would be a separate occurrence).
+    """
+    if not ev.code:
+        return False
+    candidates = conn.execute(
+        "SELECT id, fingerprint, state, code, description, occurred_at, first_seen_at, last_seen_at FROM faults "
+        "WHERE mac = ? AND kind = 'event' AND state = 'active' AND code = ? ORDER BY first_seen_at DESC, id DESC",
+        (mac, ev.code),
+    ).fetchall()
+    row = next((r for r in candidates if r["fingerprint"] not in present), None)
+    if row is None:
+        return False
+    conn.execute(
+        """UPDATE faults SET fingerprint = ?, state = 'cleared', cleared_at = ?, cleared_seen_at = ?, last_seen_at = ?,
+                             seen_count = seen_count + 1, raw = ? WHERE id = ?""",
+        (ev.fingerprint, ev.cleared_at, now, now, ev.raw, row["id"]),
+    )
+    outcome.cleared += 1
+    if cfg.notify_cleared:
+        title, body = cleared_alert(cfg, name, mac, row, ev.cleared_at, now)
+        enqueue(conn, kind="cleared", title=title, body=body, priority=3, now=now, fault_id=row["id"])
+    return True
 
 
 def _record_fault_payload(
@@ -317,22 +423,32 @@ def _record_fault_payload(
             notes.append("Fault history: response format not recognised (%s); any change to it will still be reported." % where)
     else:
         outcome.events_seen += len(events)
+        present = {ev.fingerprint for ev in events}
         for ev in events:
             row = conn.execute(
-                "SELECT id FROM faults WHERE mac = ? AND fingerprint = ? AND kind IN ('event', 'blob')", (mac, ev.fingerprint)
+                "SELECT id, state, code, description, occurred_at, first_seen_at, last_seen_at FROM faults "
+                "WHERE mac = ? AND fingerprint = ? AND kind IN ('event', 'blob')", (mac, ev.fingerprint)
             ).fetchone()
             if row is not None:
-                conn.execute("UPDATE faults SET last_seen_at = ?, seen_count = seen_count + 1 WHERE id = ?", (now, row[0]))
+                conn.execute("UPDATE faults SET last_seen_at = ?, seen_count = seen_count + 1 WHERE id = ?", (now, row["id"]))
+                again = _apply_state_change(conn, cfg, mac, name, row, ev, now, outcome)
+                if again is not None:
+                    created.append(again)
                 continue
+            if ev.state == "cleared" and not first and _merge_clearing(conn, cfg, mac, name, ev, present, now, outcome):
+                continue
+            # An entry that is ACTIVE right now is news even on the very first poll; old entries are not.
+            history = first and ev.state != "active"
             cur = conn.execute(
                 """INSERT INTO faults(mac, kind, source, fingerprint, code, description, occurred_at,
-                                      first_seen_at, last_seen_at, baseline, raw)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                      first_seen_at, last_seen_at, baseline, raw, state, cleared_at, cleared_seen_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (mac, "event", "fault_history", ev.fingerprint, ev.code, ev.description, ev.occurred_at, now, now,
-                 1 if first else 0, ev.raw),
+                 1 if history else 0, ev.raw, ev.state, ev.cleared_at, None),  # cleared_seen_at: only when we SAW it clear
             )
-            if not first:
-                created.append(NewFault(int(cur.lastrowid), mac, name, "event", ev.code, ev.description, ev.occurred_at))
+            if not history:
+                created.append(NewFault(int(cur.lastrowid), mac, name, "event", ev.code, ev.description, ev.occurred_at,
+                                        state=ev.state, cleared_at=ev.cleared_at))
         if first:
             notes.append(_baseline_history_note(events, cfg.display_tz))
     if first:

@@ -125,6 +125,8 @@ class FaultEvent:
     description: Optional[str]
     occurred_at: Optional[str]
     raw: str
+    state: Optional[str] = None  # "active" or "cleared" when the entry says so, else None (unknown)
+    cleared_at: Optional[str] = None  # when the entry says it cleared, if it gives a time
 
 
 def _flatten(ev: Dict[str, Any]) -> Dict[str, Any]:
@@ -164,6 +166,91 @@ def _stable_time(occurred_at: Optional[str], raw: Any) -> Optional[str]:
     return None if _RELATIVE_TIME.search(text) else text
 
 
+# --- is the entry active or has it cleared? ----------------------------------
+# The Wave app lists a fault as "Fault 10 / (Cleared) Superheat Fault" once it has gone away. Nobody has
+# published how the API says so, so this looks for the usual ways: a "(Cleared)" marker in the text, a status
+# word, a true/false flag, or a time it ended. Only explicit evidence counts; no evidence means "unknown".
+CLEARED_MARK = re.compile(r"(?i)[(\[]\s*(?:cleared|resolved|recovered|restored|closed|inactive)\s*[)\]]\s*[-:\u2014]?\s*")
+CLEARED_LEAD = re.compile(r"(?i)^\s*(?:cleared|resolved|recovered|restored)\b\s*[-:\u2014]*\s*")
+PURE_CODE = re.compile(r"(?i)\s*(?:fault|error|alarm|alert)\s*(?:code\s*)?[#:]?\s*\d{1,5}\s*")
+FAULT_NUMBER = re.compile(r"(?i)\b(?:fault|error|alarm|alert)\s*(?:code\s*)?[#:]?\s*(\d{1,5})\b")
+STATE_KEYS = ("status", "state", "faultstatus", "alertstatus", "eventstatus", "alarmstatus", "notificationstatus", "condition")
+CLEARED_FLAGS = ("cleared", "iscleared", "resolved", "isresolved", "recovered", "isrecovered", "closed", "isclosed",
+                 "restored", "isrestored", "inactive", "isinactive")
+ACTIVE_FLAGS = ("active", "isactive", "ongoing", "isongoing", "open", "isopen", "unresolved", "isunresolved")
+CLEARED_TIMES = ("clearedat", "clearedtime", "cleareddate", "clearedon", "clearedtimestamp", "resolvedat", "resolvedtime",
+                 "resolveddate", "recoveredat", "closedat", "restoredat", "endedat", "endtime", "enddate", "stoppedat")
+CLEARED_WORDS = re.compile(r"(?i)\b(?:clear(?:ed)?|resolved|recovered|restored|closed|inactive|ended)\b")
+ACTIVE_WORDS = re.compile(r"(?i)\b(?:active|open|raised|ongoing|triggered|unresolved|current)\b")
+_TRUE = {"true", "yes", "y", "1"}
+_FALSE = {"false", "no", "n", "0"}
+
+
+def _truth(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE:
+            return True
+        if text in _FALSE:
+            return False
+    return None
+
+
+def detect_state(flat: Dict[str, Any], texts: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """``(state, cleared_at)`` for one entry: ``("cleared", time or None)``, ``("active", None)`` or ``(None, None)``."""
+    cleared, active = False, False
+    cleared_at: Optional[str] = None
+    for key in CLEARED_TIMES:
+        value = flat.get(key)
+        if value not in (None, "", 0, "0", False):
+            cleared = True
+            cleared_at = cleared_at or coerce_time(value)
+    for key in CLEARED_FLAGS:
+        if key in flat:
+            truth = _truth(flat[key])
+            cleared, active = cleared or truth is True, active or truth is False
+    for key in ACTIVE_FLAGS:
+        if key in flat:
+            truth = _truth(flat[key])
+            active, cleared = active or truth is True, cleared or truth is False
+    for key in STATE_KEYS:
+        value = flat.get(key)
+        if isinstance(value, str):
+            if CLEARED_WORDS.search(value):
+                cleared = True
+            elif ACTIVE_WORDS.search(value):
+                active = True
+    if any(CLEARED_MARK.search(t) or CLEARED_LEAD.search(t) for t in texts):
+        cleared = True
+    if cleared:
+        return "cleared", cleared_at
+    return ("active", None) if active else (None, None)
+
+
+def strip_state_marker(text: str) -> str:
+    """The text without a leading/embedded "(Cleared)" marker (kept as is if nothing else would remain)."""
+    stripped = CLEARED_LEAD.sub("", CLEARED_MARK.sub("", text)).strip(" -:\u2014")
+    return stripped or text
+
+
+# An id that is clearly unique per entry (a UUID, a long number, a long opaque string) identifies the entry on its
+# own - even if Wave rewrites the entry when it clears. A short number may only be a list position, so it never does.
+_UUID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+
+
+def looks_unique(ident: Optional[str]) -> bool:
+    if not ident:
+        return False
+    text = str(ident).strip()
+    if _UUID.fullmatch(text) or re.fullmatch(r"\d{6,}", text):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-]{16,}", text) and re.search(r"\d", text) and re.search(r"[A-Za-z]", text))
+
+
 def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
     if not isinstance(item, dict):
         text = truncate(str(item), 300)
@@ -185,7 +272,16 @@ def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
                 texts.append(value.strip())
             if len(texts) == 2:
                 break
-    description = " — ".join(str(t) for t in texts if t not in (None, "")) or None
+    shown = [str(t) for t in texts if t not in (None, "")]
+    if code is None and not opts.code_field:  # the app's own wording: "Fault 10"
+        for text in shown:
+            found = FAULT_NUMBER.search(text)
+            if found:
+                code = found.group(1)
+                break
+    state, cleared_at = detect_state(flat, shown)
+    wording = [t for t in shown if not PURE_CODE.fullmatch(t)] or shown  # "Fault 10" alone adds nothing next to the code
+    description = " — ".join(strip_state_marker(t) for t in wording) or None
 
     time_value = flat.get(norm_key(opts.time_field)) if opts.time_field else _first(flat, TIME_KEYS)
     occurred_at = coerce_time(time_value)
@@ -199,6 +295,8 @@ def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
 
     if opts.id_fields and ident:
         fingerprint = "id:" + ident  # the owner said which fields identify an entry: trust that alone
+    elif looks_unique(ident):
+        fingerprint = "id:" + str(ident).strip()  # unique by its look, so it also survives a rewrite when the fault clears
     else:
         # An id alone is not trusted: if it were positional (0, 1, 2... newest first) a brand-new fault would
         # reuse a known id and its alert would be missed. Adding the code and an absolute time makes that
@@ -215,7 +313,8 @@ def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
             fingerprint = "|".join(parts)
         else:
             fingerprint = "h:" + digest(item, opts.volatile)[:32]
-    return FaultEvent(fingerprint, code, truncate(description, 400) if description else None, occurred_at, raw_json)
+    return FaultEvent(fingerprint, code, truncate(description, 400) if description else None, occurred_at, raw_json,
+                      state, cleared_at)
 
 
 def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[FaultEvent]], str]:

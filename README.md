@@ -201,8 +201,10 @@ it back. The code in it works once and expires within minutes. Edited `.env`? `d
 
 ## Finding the fault request
 
-The Notifications tab in the app loads its list with a request that nobody has published. You need its
-path (and parameters) once. The known calls look like this, so the missing one probably does too:
+The Notifications tab in the app (titled with your heater's name, listing entries such as *"Fault 10 —
+(Cleared) Superheat Fault — October 04, 2026 at 01:15 PM"*) loads its list with a request that nobody has
+published. You need its path (and parameters) once; you know you have the right one when its answer lists
+your faults. The known calls look like this, so the missing one probably does too:
 
 ```
 GET /wave/getApplianceList?username=<your account id>
@@ -255,6 +257,43 @@ If the notification list also holds non-fault messages, narrow it with `BW_FAULT
 expression). If `check` says it can't recognise the response format, set `BW_FAULT_LIST_PATH` (and, if
 needed, the other `BW_FAULT_*` options) — the raw response is stored either way, so nothing is lost.
 Even an unrecognised response still triggers an alert when it *changes*.
+
+---
+
+## Faults that clear on their own
+
+Some faults — like *Fault 10, Superheat Fault* — come and go by themselves. The Wave app keeps them in its
+Notifications history and, once one has gone away, shows it as **"(Cleared)"**. bwwatch reads that **history**, not
+just the heater's live status, so a fault that appeared and cleared between two hourly checks is still found: it is
+logged, and you get an alert marked *(cleared)*.
+
+For every fault it records the code and description, **when it happened** (the app's own time), when bwwatch first
+noticed it, whether it is **active or cleared**, and when it cleared (the time the entry gives, or else the window
+between two checks) and how long it lasted. `./bwctl faults` and `./bwctl export faults` show all of it, and
+`./bwctl status` lists any fault still active.
+
+| What happened | Alert you get |
+|---------------|---------------|
+| A new fault, active | *Water heater fault 10 — name* (priority 4 by default) |
+| A fault that had already cleared when bwwatch first saw it | *Water heater fault 10 **(cleared)** — name*: "it had already cleared by the time bwwatch checked" |
+| A fault bwwatch saw active, now cleared | *Water heater fault 10 **cleared** — name*, with when it began and cleared and "It lasted about 42 minutes." (turn off with `NOTIFY_CLEARED=false`) |
+| A cleared fault that comes back | *Water heater fault 10 **(active again)** — name* |
+
+A fault that is **active at the moment you install** is reported straight away; older, cleared entries are logged
+quietly as history (and listed in the first "Watching…" message). If Wave rewrites an entry when it clears — giving it
+a new time — bwwatch recognises it as the same fault rather than reporting it twice, and an entry with a clearly unique
+id is followed by that id alone.
+
+**How quickly you hear.** Checking hourly loses nothing, because the history keeps every fault; only the *alert* can be
+up to an hour late. For faster alerts set `BW_POLL_INTERVAL_SECONDS=900` (every 15 minutes, about 384 requests a day;
+the minimum is 300) in `.env` and run `./bwctl restart`.
+
+**Limits, honestly.** All of this needs the Notifications request (see [Finding the fault request](#finding-the-fault-request));
+until it is set, bwwatch can only watch settings and fault-like status flags. And nobody has published how the API
+*says* an entry has cleared — only the app's "(Cleared)" wording is known. bwwatch recognises the usual ways (a
+"(Cleared)" marker in the text, a status word such as *cleared* / *resolved*, a true/false flag, or an end time). If an
+entry doesn't say, its state shows as `-` and it is treated exactly like any other entry: logged and alerted once. The
+raw responses are stored either way, so the first real response can be used to tune this.
 
 ---
 
@@ -460,7 +499,7 @@ running container, or a one-off one if the service is stopped.
 | `./bwctl …` | What it does |
 |-------------|--------------|
 | `status` | one-screen summary: service health, last poll, heater settings, faults, pending alerts, backups |
-| `faults [--limit N] [--all] [--raw]` | the logged faults, newest first |
+| `faults [--limit N] [--all] [--raw]` | the logged faults, newest first: when it happened, code, whether it is active or cleared, when it cleared |
 | `export faults\|polls\|readings [--out FILE]` | CSV, e.g. for a warranty claim: `./bwctl export faults > faults.csv` |
 | `check` | read everything once and show what bwwatch understands (writes nothing) |
 | `login` | sign in again (needed if you get the *"sign-in needs attention"* alert) |
@@ -479,7 +518,8 @@ Under the hood these are the container's own commands — `docker compose exec b
 `setup` (the guided setup wizard; `install.sh` runs it for you), `healthcheck` (exit 0 if the service is alive; Docker
 uses it) and `version`.
 
-**Alerts you may receive:** *Water heater fault N — name* (a new fault); *Wave sign-in needs attention —
+**Alerts you may receive:** *Water heater fault N — name* (a new fault; *(cleared)* if it had already gone,
+*(active again)* if it came back); *Water heater fault N cleared — name*; *Wave sign-in needs attention —
 faults are NOT being monitored* (run `./bwctl login`); *Wave monitoring is failing* / *working again*;
 *Water heater setting changed* (e.g. mode `Heat Pump → Electric` — handy if the heater falls back);
 *Fault flag cleared*; *bwwatch database was damaged and has been recovered*; *Watching …* / *bwwatch
@@ -545,7 +585,7 @@ API), `cycle.py` (one poll), `service.py` (the loop, backups, health), `db.py` (
 ### Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .      # about 380 tests, no installs needed, about a minute
+python3 -m unittest discover -s tests -t .      # about 430 tests, no installs needed, about two minutes
 ```
 
 They run against a mock Wave cloud and mock alert services: sign-in rotation, retries, rate limits, every alert
