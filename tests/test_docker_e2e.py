@@ -32,6 +32,9 @@ from .pty_driver import CTRL_C, converse
 
 ROOT = Path(__file__).resolve().parents[1]
 ENABLED = os.environ.get("BWWATCH_DOCKER_E2E") == "1"
+# "bridge": Docker's normal networking, as on a VPS (the compose file's own private network; the mock cloud listens on
+# the docker bridge's address). "host": the container shares the host's network - for a daemon that has no bridge.
+NETWORK = os.environ.get("BWWATCH_E2E_NETWORK", "bridge")
 FAULT_REQUEST = "GET /wave/getNotifications?username={account_id}&macAddress={mac}"
 AWKWARD_JSON = '{"X-Awkward": "it\'s $HOME # not a comment"}'
 DECOY_CONTAINER, DECOY_VOLUME, BASE_IMAGE = "bwdecoy", "bwdecoy-vol", "python:3.12-slim-bookworm"
@@ -42,6 +45,28 @@ LAST_QUESTION = (r"Did the .bwwatch started. message arrive\? \[Y/n\] ", "y")
 
 def docker(*args: str, check: bool = False, timeout: float = 120) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout, check=check)
+
+
+def listening_ports() -> set:
+    """TCP ports something is listening on right now, read from the kernel's own table."""
+    found = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 3 and fields[3] == "0A":  # state LISTEN
+                found.add(int(fields[1].rsplit(":", 1)[1], 16))
+    return found
+
+
+def docker_objects() -> Dict[str, set]:
+    """Names of every container, network and volume, so before and after can be compared."""
+    def names(*args: str) -> set:
+        return {n for n in docker(*args, "--format", "{{.Names}}" if args[0] == "ps" else "{{.Name}}").stdout.split() if n}
+    return {"containers": names("ps", "-a"), "networks": names("network", "ls"), "volumes": names("volume", "ls")}
 
 
 def docker_available() -> bool:
@@ -65,6 +90,9 @@ class RealInstall(unittest.TestCase):
             raise unittest.SkipTest("no Docker daemon is reachable")
         if docker("inspect", "-f", "{{.Id}}", "bwwatch").returncode == 0:
             raise unittest.SkipTest("a container called bwwatch already exists here; refusing to touch it")
+        if docker("network", "inspect", "bwwatch_default").returncode == 0:
+            raise unittest.SkipTest("a network called bwwatch_default already exists here (left by an aborted run?): "
+                                    "remove it with  docker network rm bwwatch_default  and run again")
         cls.base = Path(tempfile.mkdtemp(prefix="bwe2e."))
         cls.home, cls.tmp, cls.elsewhere = (cls.base / n for n in ("home", "tmp", "elsewhere"))
         for folder in (cls.home, cls.tmp, cls.elsewhere):
@@ -76,15 +104,20 @@ class RealInstall(unittest.TestCase):
         shutil.copytree(ROOT / "bwwatch", cls.dir / "bwwatch", ignore=shutil.ignore_patterns("__pycache__"))
 
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-        for old, new in (
-            ("    build: .\n", "    build:\n      context: .\n      network: none   # test-only: nothing to download\n"),
-            ("    restart: unless-stopped\n", "    restart: unless-stopped\n    network_mode: host   # test-only: the mock cloud is on the host's loopback\n"),
-        ):
+        changes = [("    build: .\n", "    build:\n      context: .\n      network: none   # test-only: nothing to download\n")]
+        if NETWORK == "host":
+            changes.append(("    restart: unless-stopped\n", "    restart: unless-stopped\n    network_mode: host   # test-only: the mock cloud is on the host's loopback\n"))
+        for old, new in changes:
             assert old in compose, old
             compose = compose.replace(old, new, 1)
         (cls.dir / "docker-compose.yml").write_text(compose, encoding="utf-8")
 
-        cls.mock = MockWave().start()
+        if NETWORK == "bridge":
+            gateway = docker("network", "inspect", "bridge", "-f", "{{(index .IPAM.Config 0).Gateway}}").stdout.strip()
+            cls.mock = MockWave(host="0.0.0.0", public_host=gateway).start()
+        else:
+            cls.mock = MockWave().start()
+        cls.docker_before = docker_objects()
         cls.addClassCleanup(cls.mock.stop)
         cls.login_code = cls.mock.issue_login_code("e2e-login-code-" + "a" * 24)
         # What a person would have typed into .env if their servers lived elsewhere: the wizard keeps these.
@@ -102,6 +135,7 @@ class RealInstall(unittest.TestCase):
         docker("rm", "-f", "bwwatch", DECOY_CONTAINER)
         docker("volume", "rm", "-f", DECOY_VOLUME)
         docker("image", "rm", "bwwatch:local")
+        docker("network", "rm", "bwwatch_default")  # only exists if a step failed before the uninstall
         if (cls.dir / "data").exists():  # files owned by the container's user: let a container remove them
             docker("run", "--rm", "--network", "none", "-v", "%s:/data" % (cls.dir / "data"), "--entrypoint", "find",
                    BASE_IMAGE, "/data", "-mindepth", "1", "-delete")
@@ -162,8 +196,11 @@ class RealInstall(unittest.TestCase):
 
     # --- 1. the install --------------------------------------------------------
     def test_1_install_walks_through_everything(self):
+        listening_before = listening_ports()
         status, text = self.installer(script=self.wizard_answers())
         self.assertEqual(status, 0, text[-3000:])
+        self.assertIn("bwwatch listens on no port", text)
+        self.assertIn("The container publishes no port", text)
         for part in ("Part 1 of 4", "Part 2 of 4", "Part 3 of 4", "Part 4 of 4"):
             self.assertIn(part, text)
         self.assertIn("Built the image bwwatch:local", text)
@@ -181,6 +218,15 @@ class RealInstall(unittest.TestCase):
         self.assertIn("ALL", self.container("{{.HostConfig.CapDrop}}"))
         self.assertIn("no-new-privileges", self.container("{{.HostConfig.SecurityOpt}}"))
         self.assertEqual(self.container('{{index .Config.Labels "com.docker.compose.project.working_dir"}}'), str(self.dir.resolve()))
+
+        # networking: it listens on nothing and publishes nothing - no new listening port anywhere on the host
+        self.assertEqual(self.container("{{json .HostConfig.PortBindings}}"), "{}")
+        self.assertEqual(docker("port", "bwwatch").stdout.strip(), "")
+        self.assertEqual(listening_ports() - listening_before, set(), "no new listening socket on the server")
+        if NETWORK == "bridge":
+            self.assertEqual(self.container("{{.HostConfig.NetworkMode}}"), "bwwatch_default")
+            made = docker_objects()["networks"] - self.docker_before["networks"]
+            self.assertEqual(made, {"bwwatch_default"}, "the one private network it needs, and nothing else")
 
         # what the wizard chose is what the installer put in place: private, complete, with the old file kept
         env_path = self.dir / ".env"
@@ -366,6 +412,12 @@ class RealInstall(unittest.TestCase):
         self.assertEqual(docker("inspect", "-f", "{{.Name}}", DECOY_CONTAINER).returncode, 0, "someone else's container survives")
         self.assertEqual(docker("volume", "inspect", DECOY_VOLUME).returncode, 0, "someone else's volume survives")
         self.assertEqual(docker("image", "inspect", BASE_IMAGE).returncode, 0, "the shared base image survives")
+
+        now = docker_objects()
+        for kind in ("containers", "networks", "volumes"):
+            added = now[kind] - self.docker_before[kind] - {DECOY_CONTAINER, DECOY_VOLUME}
+            self.assertEqual(added, set(), "uninstall leaves no %s behind" % kind)
+            self.assertEqual(self.docker_before[kind] - now[kind], set(), "and removes no one else's %s" % kind)
 
         self.assertEqual(list((self.dir / "data").iterdir()), [], "recorded data erased")
         remaining = {p.name for p in self.dir.iterdir()}

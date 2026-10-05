@@ -30,7 +30,9 @@ def make_jwt(claims: Dict[str, Any]) -> str:
 
 
 class MockWave:
-    def __init__(self) -> None:
+    def __init__(self, host: str = "127.0.0.1", public_host: Optional[str] = None) -> None:
+        """``host`` is where it listens; ``public_host`` is the address clients should use (default: the same)."""
+        self.public_host = public_host or host
         self.lock = threading.RLock()
         self.oid = "11111111-2222-3333-4444-555555555555"
         self.requests: List[Dict[str, Any]] = []
@@ -56,7 +58,7 @@ class MockWave:
         self.sink_status: Dict[str, int] = {}
         self.sinks: Dict[str, List[Dict[str, Any]]] = {"ntfy": [], "telegram": [], "webhook": [], "ha": [], "heartbeat": []}
         self._counter = 0
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.server = ThreadingHTTPServer((host, 0), _Handler)
         self.server.mock = self  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=lambda: self.server.serve_forever(poll_interval=0.02), daemon=True)
 
@@ -71,7 +73,7 @@ class MockWave:
 
     @property
     def url(self) -> str:
-        return "http://127.0.0.1:%d" % self.server.server_address[1]
+        return "http://%s:%d" % (self.public_host, self.server.server_address[1])
 
     # --- helpers for tests --------------------------------------------------
     def issue_login_code(self, code: str = "one-time-login-code-abcdefghijklmnop") -> str:

@@ -87,6 +87,7 @@ EOF
 # ---------------------------------------------------------------------------------- questions
 STOPPED_SERVICE=0
 BG_PID=''
+TIDY_NETWORK=0   # set once an install is under way: if it is abandoned before the container exists, drop the network it made
 
 cancelled() {
   blank
@@ -131,6 +132,10 @@ cleanup() {
     STOPPED_SERVICE=0
     say "Starting bwwatch again (it was paused for the setup)..."
     dc start >/dev/null 2>&1 && say "bwwatch is running again."
+  fi
+  if [ "$TIDY_NETWORK" = 1 ] && ! container_exists; then
+    TIDY_NETWORK=0
+    dc down >/dev/null 2>&1   # nothing of ours is running: this only removes the private network the setup created
   fi
   return "$_rc"
 }
@@ -307,6 +312,70 @@ check_boot() {
   return 0
 }
 
+# ---------------------------------------------------------------------------------- ports and firewall (read-only)
+# bwwatch listens on nothing: it only makes outgoing HTTPS requests. These checks show that, and report what the
+# firewall and the server's listening ports look like. They only READ: no rule, port or service is ever changed.
+listening_ports() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -ltn 2>/dev/null | awk 'NR != 1 { n = split($4, a, ":"); print a[n] }' | sort -un | tr '\n' ' '
+}
+
+firewall_report() {
+  if command -v ufw >/dev/null 2>&1; then
+    if [ "$(id -u)" = 0 ]; then
+      _ufw=$(ufw status verbose 2>/dev/null)
+      case $_ufw in
+        *"Status: active"*)
+          _pol=$(printf '%s\n' "$_ufw" | sed -n 's/^Default: //p')
+          ok "ufw is active${_pol:+ (policy: $_pol)}. Nothing about it needs to change for bwwatch."
+          case $_pol in
+            *"deny (outgoing)"*|*"reject (outgoing)"*)
+              warn "ufw denies outgoing connections by default. bwwatch needs outgoing HTTPS (TCP 443) and DNS."
+              hint "Docker's own rules normally let a container's traffic through anyway, and the connection test in"
+              hint "the guided setup checks the real path from inside the container. If that test fails, look here first." ;;
+          esac ;;
+        *"Status: inactive"*) ok "ufw is installed but inactive, so it cannot be in the way." ;;
+        *) hint "ufw is installed, but its status could not be read; nothing was changed." ;;
+      esac
+    else
+      hint "ufw is installed; run the installer as root to let it read the firewall status. (Skipped; nothing was changed.)"
+    fi
+  elif command -v systemctl >/dev/null 2>&1 && [ "$(systemctl is-active firewalld 2>/dev/null)" = active ]; then
+    ok "firewalld is active. bwwatch needs nothing opened in it (it only makes outgoing HTTPS requests)."
+  else
+    hint "No ufw found. Whatever firewall you use, bwwatch needs no inbound port; it only needs outgoing HTTPS (TCP 443)."
+  fi
+}
+
+check_ports_and_firewall() {
+  if dc config 2>/dev/null | grep -Eq '^[[:space:]]+(ports:|network_mode:[[:space:]]*host)'; then
+    warn "docker-compose.yml publishes a port or uses the host network. bwwatch itself needs neither."
+    hint "It only makes outgoing HTTPS requests; remove the 'ports:' / 'network_mode:' lines unless you added them on purpose."
+  else
+    ok "bwwatch listens on no port. It only makes outgoing HTTPS requests, so there is nothing to open in the"
+    hint "firewall, nothing to put behind nginx and no subdomain to set up: you reach it with ./bwctl, and it"
+    hint "reaches you with push alerts."
+  fi
+  _ports=$(listening_ports)
+  if [ -n "$_ports" ]; then
+    # shellcheck disable=SC2086
+    set -- $_ports
+    _shown=$(printf '%s\n' "$_ports" | tr -s ' ' '\n' | sed '/^$/d' | head -n 10 | tr '\n' ' ')
+    _shown=${_shown% }
+    ok "$# TCP port(s) are already in use on this server ($_shown$([ "$#" -gt 10 ] && printf ' ...')). bwwatch uses none of them and adds none."
+  fi
+  firewall_report
+  return 0
+}
+
+report_published_ports() {
+  _pb=$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$CONTAINER" 2>/dev/null)
+  case $_pb in
+    ''|'{}'|'null') ok "The container publishes no port: nothing outside can connect to it." ;;
+    *) warn "The container publishes ports ($_pb). bwwatch itself needs none." ;;
+  esac
+}
+
 part1() {
   heading "Part 1 of 4: Checking this server"
   check_folder || return 1
@@ -316,6 +385,7 @@ part1() {
   ensure_env_file || return 1
   check_compose_file || return 1
   check_conflict || return 1
+  check_ports_and_firewall
   check_disk
   check_boot
   return 0
@@ -446,6 +516,7 @@ part4() {
   fi
   STOPPED_SERVICE=0
   ok "bwwatch is running and set to restart by itself after a crash or reboot."
+  report_published_ports
 
   say "Now waiting for its first check of your water heater (up to about 2.5 minutes)..."
   dc exec -T bwwatch bwwatch verify --wait 150 --since "$SINCE" >"$OUT" </dev/null; _rc=$?
@@ -503,6 +574,9 @@ finish() {
   say "  ./install.sh --check           run the health check again"
   say "  ./install.sh --reconfigure     change alerts, time zone, the Notifications request"
   say
+  say "How you reach it: there is no web page and no port. Use ./bwctl on this server; it reaches you with"
+  say "push alerts. Nothing needs to be opened in the firewall or put behind nginx."
+  say
   say "Everything it created is in $DIR:"
   say "  .env          your settings (private)"
   say "  data/         the database, backups and the Wave sign-in (private; back it up)"
@@ -534,6 +608,7 @@ mode_install() {
   RECONFIGURE=${1:-0}
   banner
   part1 || exit 1
+  TIDY_NETWORK=1
   if [ "$RECONFIGURE" = 0 ] && container_exists && ! cmp -s "$DIR/.env" "$DIR/.env.example"; then
     blank
     say "bwwatch is already installed here."
@@ -555,6 +630,7 @@ mode_install() {
   part2 || exit 1
   part3 || exit 1
   part4 || exit 1
+  TIDY_NETWORK=0
   finish
   exit 0
 }
@@ -574,6 +650,7 @@ mode_check() {
     return 1
   fi
   ok "The container is running."
+  report_published_ports
   _report=$(dc exec -T bwwatch bwwatch verify </dev/null); _rc=$?
   if [ -z "$_report" ]; then
     fail "Could not run the health check inside the container."
@@ -595,7 +672,7 @@ mode_uninstall() {
   check_docker || exit 1
   check_conflict || exit 1
   say "This will:"
-  say "  - stop and remove the container \"$CONTAINER\""
+  say "  - stop and remove the container \"$CONTAINER\" and the private Docker network it uses"
   say "  - remove the image \"$IMAGE\""
   say "It will NOT touch anything else on this server: no other containers, images, volumes or"
   say "networks, and not the Python base image. Your settings (.env) and recorded data ($DIR/data:"
@@ -614,10 +691,11 @@ mode_uninstall() {
   if ! IFS= read -r _answer; then cancelled; fi
   if [ "$_answer" = DELETE ]; then _wipe=1; fi
 
-  # Compose reads .env even to stop a container, so .env goes last. The service is stopped before its data
-  # is erased: on its way out it writes status.json and folds the database log into the database again.
+  # Compose reads .env even to stop a container, so .env goes last. The service is stopped before its data is
+  # erased (on its way out it writes status.json and folds the database log into the database again), and the
+  # container and its private network are removed after the erasing, because the erasing needs that network.
   if [ ! -f "$DIR/.env" ]; then cp "$DIR/.env.example" "$DIR/.env"; fi
-  if dc down >"$OUT" 2>&1; then ok "Removed the container."; else warn "Docker said:"; tail -n 5 "$OUT" | indent; fi
+  dc stop >/dev/null 2>&1
   if [ "$_wipe" = 1 ]; then
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
       # the files in data/ belong to the container's own user, so the container removes them
@@ -632,6 +710,7 @@ mode_uninstall() {
       warn "Could not erase data/; remove it yourself:  sudo rm -rf \"$DIR/data\""
     fi
   fi
+  if dc down >"$OUT" 2>&1; then ok "Removed the container and the private Docker network it used."; else warn "Docker said:"; tail -n 5 "$OUT" | indent; fi
   if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     if docker image rm "$IMAGE" >"$OUT" 2>&1; then ok "Removed the image $IMAGE."; else warn "Could not remove the image:"; tail -n 3 "$OUT" | indent; fi
   fi

@@ -35,6 +35,8 @@ DEFAULTS = {
                   "  [ OK ] Startup alert  \"bwwatch started\" was delivered at 2026-10-04 22:46 UTC\n"
                   "  [ OK ] Alert channels  ntfy\n",
     "wipe_rc": 0,
+    "port_bindings": {},               # what the running container publishes ({} = nothing)
+    "config_ports": False,             # does `compose config` show a published port?
     "container": {"exists": False, "running": False, "owner": ""},
     "image": False,
 }
@@ -127,7 +129,9 @@ def inspect(rest, sc, state) -> int:
         err("Error: No such object: bwwatch\n")
         return 1
     fmt = rest[1]
-    if fmt == "{{.Id}}":
+    if fmt == "{{json .HostConfig.PortBindings}}":
+        out(json.dumps(sc["port_bindings"]) + "\n")
+    elif fmt == "{{.Id}}":
         out("0123456789abcdef\n")
     elif fmt == "{{.State.Running}}":
         out("true\n" if box["running"] else "false\n")
@@ -186,6 +190,12 @@ def compose(rest, sc, state) -> int:
             if env.exists() and "BROKEN" in env.read_text(encoding="utf-8"):
                 err("failed to read %s: line 3: unexpected character \"B\" in variable name\n" % env)
                 return 1
+        return 0
+
+    if sub == "config" and not args:
+        out("name: bwwatch\nservices:\n  bwwatch:\n    image: bwwatch:local\n")
+        if sc["config_ports"]:
+            out("    ports:\n      - mode: ingress\n        target: 8080\n        published: \"56284\"\n")
         return 0
 
     if sub == "build" and not args:

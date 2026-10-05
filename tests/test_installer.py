@@ -135,6 +135,34 @@ class Sandbox:
         env.update(extra)
         return env
 
+    def shim(self, name: str, body: str) -> None:
+        """A pretend system command that comes first on PATH."""
+        path = self.bin / name
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+
+    def pretend_ufw(self, status_text: str) -> None:
+        (self.world / "ufw.txt").write_text(status_text, encoding="utf-8")
+        self.shim("ufw", 'echo "$*" >> "$FAKE_DOCKER_WORLD/ufw.calls"\n[ "$1" = status ] && cat "$FAKE_DOCKER_WORLD/ufw.txt"\nexit 0\n')
+
+    def pretend_not_root(self) -> None:
+        (self.world / "uid").write_text("1000\n", encoding="utf-8")
+        self.shim("id", '[ "$1" = "-u" ] && [ -f "$FAKE_DOCKER_WORLD/uid" ] && { cat "$FAKE_DOCKER_WORLD/uid"; exit 0; }\nexec %s "$@"\n' % shutil.which("id"))
+
+    def pretend_listening(self, ports) -> None:
+        lines = ["State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process"]
+        for number, port in enumerate(ports):
+            where = ("0.0.0.0", "[::]", "127.0.0.1", "*")[number % 4]
+            lines.append("LISTEN 0      128          %s:%d         0.0.0.0:*" % (where, port))
+        (self.world / "ss.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.shim("ss", 'cat "$FAKE_DOCKER_WORLD/ss.txt"\n')
+
+    def ufw_calls(self) -> list:
+        try:
+            return (self.world / "ufw.calls").read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
     def put_env(self, text: str) -> None:
         """An .env as an earlier install would have left it (private, and not counted as new)."""
         path = self.dir / ".env"
@@ -238,6 +266,15 @@ class Scripts(unittest.TestCase):
         for line in text.splitlines():
             if re.search(r"\brm +-f", line) and not line.strip().startswith(("#", "say", "hint", "warn")):
                 self.assertRegex(line, r'"\$(OUT|NEW_ENV|LOG|DIR)|"\$DIR"/', line)
+
+    def test_the_firewall_and_the_network_are_only_ever_read(self):
+        banned = r"\b(iptables|ip6tables|iptables-save|nft|firewall-cmd|sysctl|ifconfig|route|brctl)\b|\bip +(link|addr|route|rule|netns)\b"
+        for name in ("install.sh", "bwctl"):
+            for line in self.executed_lines(name):
+                self.assertIsNone(re.search(banned, line), "%s touches the firewall or network: %s" % (name, line))
+                unquoted = re.sub(r'"[^"]*"', "", line)  # words inside printed messages do not count
+                if re.search(r"\bufw\b", unquoted):
+                    self.assertTrue(re.search(r"command -v ufw|ufw status verbose", line), "%s: ufw is only ever asked for its status: %s" % (name, line))
 
     def test_every_compose_call_is_pinned_to_this_project(self):
         for name in ("install.sh", "bwctl"):
@@ -413,6 +450,124 @@ class Preflight(SandboxCase):
         self.assertIn("MB free for Docker's storage", done.out + " MB free for Docker's storage")
 
 
+# =============================================================================== install.sh: ports and firewall
+UFW_NORMAL = """Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+"""
+
+
+class PortsAndFirewall(SandboxCase):
+    """bwwatch listens on nothing; the installer says so, proves it, and only ever READS the firewall."""
+
+    def test_it_says_plainly_that_nothing_listens(self):
+        box = self.box()
+        done = box.run(stdin="y\ny\n")
+        self.assertEqual(done.code, 0, done.text)
+        self.assertIn("bwwatch listens on no port", done.out)
+        for phrase in ("nothing to open in the", "nginx", "no subdomain", "./bwctl", "push alerts"):
+            self.assertIn(phrase, done.out)
+        self.assertIn("The container publishes no port", done.out, "and the running container is checked afterwards")
+        self.assertIn("there is no web page and no port", done.out)
+
+    def test_a_compose_file_that_publishes_a_port_is_flagged_not_silently_accepted(self):
+        box = self.box()
+        box.scenario(config_ports=True)
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("publishes a port or uses the host network", done.out)
+        self.assertIn("remove the 'ports:'", done.out)
+        self.assertNotIn("bwwatch listens on no port", done.out)
+
+    def test_a_container_that_does_publish_a_port_is_flagged_after_it_starts(self):
+        box = self.box()
+        box.scenario(port_bindings={"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "56284"}]})
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("The container publishes ports", done.out)
+        self.assertIn("56284", done.out)
+
+    def test_check_reports_the_published_ports_too(self):
+        box = self.box()
+        box.set_container(running=True)
+        self.assertIn("publishes no port", box.run("--check").out)
+        box.scenario(port_bindings={"80/tcp": [{"HostPort": "80"}]})
+        self.assertIn("publishes ports", box.run("--check").out)
+
+    def test_ports_already_in_use_are_listed_for_the_record_and_left_alone(self):
+        box = self.box()
+        box.pretend_listening([22, 80, 443, 5432, 80])
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("4 TCP port(s) are already in use on this server (22 80 443 5432)", done.out)
+        self.assertIn("uses none of them and adds none", done.out)
+
+    def test_a_long_list_of_ports_is_shortened(self):
+        box = self.box()
+        box.pretend_listening(list(range(1000, 1015)))
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("15 TCP port(s)", done.out)
+        self.assertIn("1009 ...)", done.out)
+        self.assertNotIn("1010", done.out)
+
+    def test_no_ss_no_port_line(self):
+        box = self.box()
+        box.pretend_listening([])
+        done = box.run(stdin="y\ny\n")
+        self.assertNotIn("already in use", done.out)
+
+    def test_ufw_active_with_the_usual_policy_needs_nothing(self):
+        box = self.box()
+        box.pretend_ufw(UFW_NORMAL)
+        done = box.run(stdin="y\ny\n")
+        self.assertEqual(done.code, 0, done.text)
+        self.assertIn("ufw is active (policy: deny (incoming), allow (outgoing), disabled (routed))", done.out)
+        self.assertIn("Nothing about it needs to change", done.out)
+        self.assertNotIn("denies outgoing", done.out)
+        self.assertEqual(box.ufw_calls(), ["status verbose"], "the only thing ever asked of ufw")
+
+    def test_ufw_blocking_outgoing_is_a_warning_that_points_at_the_real_test(self):
+        box = self.box()
+        box.pretend_ufw(UFW_NORMAL.replace("allow (outgoing)", "deny (outgoing)"))
+        done = box.run(stdin="y\ny\n")
+        self.assertEqual(done.code, 0, "a warning, not a stop: the real test decides")
+        self.assertIn("ufw denies outgoing connections by default", done.out)
+        self.assertIn("TCP 443", done.out)
+        self.assertIn("guided setup checks the real path", done.out)
+        self.assertEqual(box.ufw_calls(), ["status verbose"])
+
+    def test_ufw_inactive_cannot_be_in_the_way(self):
+        box = self.box()
+        box.pretend_ufw("Status: inactive\n")
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("ufw is installed but inactive", done.out)
+
+    def test_without_root_the_firewall_is_not_even_asked(self):
+        box = self.box()
+        box.pretend_ufw(UFW_NORMAL)
+        box.pretend_not_root()
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("run the installer as root to let it read the firewall status", done.out)
+        self.assertIn("nothing was changed", done.out)
+        self.assertEqual(box.ufw_calls(), [])
+
+    def test_the_firewall_is_never_changed_whatever_it_says(self):
+        for text in (UFW_NORMAL, "Status: inactive\n", "garbage\n", UFW_NORMAL.replace("allow (outgoing)", "reject (outgoing)")):
+            box = self.box()
+            box.pretend_ufw(text)
+            box.run(stdin="y\ny\n")
+            self.assertTrue(all(call == "status verbose" for call in box.ufw_calls()), box.ufw_calls())
+
+    def test_firewalld_is_noticed_without_touching_it(self):
+        box = self.box()
+        box.shim("systemctl", '[ "$1" = "is-active" ] && [ "$2" = "firewalld" ] && { echo active; exit 0; }\necho enabled\n')
+        done = box.run(stdin="y\ny\n")
+        self.assertIn("firewalld is active", done.out)
+        self.assertIn("needs nothing opened", done.out)
+
+
 # =============================================================================== install.sh: the whole install
 class Install(SandboxCase):
     def test_a_complete_install(self):
@@ -494,6 +649,30 @@ class Install(SandboxCase):
         self.assertNotIn("compose run setup", box.kinds())
         self.assertNotIn("compose up", box.kinds())
         self.assertIn("no such host", (box.dir / "install.log").read_text(encoding="utf-8"))
+
+    def test_an_abandoned_first_install_leaves_no_network_behind(self):
+        box = self.box()
+        box.scenario(wizard_rc=130)
+        box.run(stdin="y\n")
+        self.assertEqual(box.kinds()[-1], "compose down", "the private network the setup created is removed again")
+        box = self.box()
+        box.scenario(build="fail")
+        box.run(stdin="y\n")
+        self.assertEqual(box.kinds()[-1], "compose down")
+
+    def test_but_an_existing_container_is_never_taken_down_by_an_abandoned_reconfigure(self):
+        box = self.box()
+        box.put_env("NTFY_TOPIC=my-old-topic\n")
+        box.set_container(running=True)
+        box.scenario(wizard_rc=130)
+        box.run("--reconfigure", stdin="y\n")
+        self.assertNotIn("compose down", box.kinds())
+        self.assertTrue(box.state()["container"]["exists"])
+
+    def test_a_finished_install_keeps_its_network(self):
+        box = self.box()
+        box.run(stdin="y\ny\n")
+        self.assertNotIn("compose down", box.kinds())
 
     def test_cancelling_the_guided_setup_installs_nothing(self):
         box = self.box()
@@ -669,8 +848,9 @@ class Reconfigure(SandboxCase):
         done = box.run("--reconfigure", stdin="y\n")
         self.assertEqual(done.code, 130)
         self.assertIn("bwwatch is running again", done.out)
-        kinds = box.kinds()
+        kinds = [k for k in box.kinds() if k != "inspect"]
         self.assertEqual(kinds[-1], "compose start")
+        self.assertNotIn("compose down", kinds, "the old container is never taken down by a cancelled reconfigure")
         self.assertTrue(box.state()["container"]["running"])
         self.assertEqual((box.dir / ".env").read_text(encoding="utf-8"), "NTFY_TOPIC=my-old-topic\n")
 
@@ -812,9 +992,11 @@ class Uninstall(SandboxCase):
         done = box.run("--uninstall", stdin="y\nDELETE\n")
         self.assertEqual(done.code, 0, done.text)
         kinds = box.kinds()
-        self.assertLess(kinds.index("compose down"), kinds.index("compose run find"),
+        self.assertLess(kinds.index("compose stop"), kinds.index("compose run find"),
                         "the service is stopped first: on its way out it writes into data/ again")
-        self.assertLess(kinds.index("compose run find"), kinds.index("image rm"), "data is erased while the image still exists")
+        self.assertLess(kinds.index("compose run find"), kinds.index("compose down"),
+                        "the erasing runs on the project's network, so the network is removed after it")
+        self.assertLess(kinds.index("compose down"), kinds.index("image rm"), "data is erased while the image still exists")
         wipe = [c["argv"] for c in box.calls() if kind(c) == "compose run find"][0]
         self.assertEqual(wipe[wipe.index("--entrypoint"):], ["--entrypoint", "find", "bwwatch", "/data", "-mindepth", "1", "-delete"])
         self.assertFalse((box.dir / ".env").exists())
@@ -845,6 +1027,12 @@ class Uninstall(SandboxCase):
         self.assertNotIn("compose down", box.kinds())
         self.assertNotIn("image rm", box.kinds())
         self.assertTrue((box.dir / ".env").exists())
+
+    def test_the_container_is_stopped_and_its_network_removed_even_when_nothing_is_erased(self):
+        box = self.installed()
+        box.run("--uninstall", stdin="y\n\n")
+        kinds = box.kinds()
+        self.assertLess(kinds.index("compose stop"), kinds.index("compose down"))
 
     def test_a_missing_env_does_not_block_stopping_the_container(self):
         box = self.installed()

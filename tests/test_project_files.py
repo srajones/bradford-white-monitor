@@ -142,6 +142,8 @@ class InstallerDocs(unittest.TestCase):
             ("never installs software", "no software is installed for you"),
         ):
             self.assertTrue(promise.lower() in (self.INSTALL + README).lower(), evidence)
+        for word in ("nginx", "subdomain", "ufw", "no port"):
+            self.assertTrue(word in README.lower(), "the README should answer the %r question" % word)
         self.assertTrue("headless browser" in README.lower())
         self.assertTrue("no browser" in README.lower())
 

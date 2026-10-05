@@ -51,7 +51,8 @@ user who may use Docker, or with `sudo ./install.sh`. If `git` is missing: `apt-
 The installer does four things, and tells you what it is doing and whether each one worked:
 
 1. **Checks this server** — Docker running and new enough, the Compose file valid, no clash with another
-   container named `bwwatch`, enough disk space, Docker set to start at boot (it only *warns* about that).
+   container named `bwwatch`, that nothing will listen on a port, what your firewall looks like (read-only),
+   enough disk space, Docker set to start at boot (it only *warns* about that).
 2. **Builds the program** — a small Docker image from the files in the folder.
 3. **Guided setup** — plain questions, each one tested for real:
    - *Can this server reach Bradford White?*
@@ -91,6 +92,38 @@ before they are replaced. When something fails, it says what, why it usually hap
 
 ---
 
+## How do I reach it? Ports, nginx, subdomains, the firewall
+
+**You don't, and it needs none of that.** bwwatch has no web page and listens on **no port**: it is a background
+service that only makes *outgoing* HTTPS requests (to Bradford White and to your alert service). You use it on the
+server with `./bwctl` (over SSH), and it reaches you with push alerts — or a Home Assistant webhook. So there is no
+`IP:port` to open (not 56284, not any other), no nginx and no subdomain. `docker-compose.yml` has no `ports:`
+line, the installer checks that and then checks that the running container publishes none, and the tests insist on it.
+(If you ever add a web page to a project like this, keep it off the public internet — behind a VPN such as Tailscale
+or an SSH tunnel to `localhost`. A non-standard port only hides a service from casual scans; it is not protection.)
+
+What the installer checks about ports and the firewall — **read-only; it never changes a rule, a port or a service**:
+
+- The Compose file publishes no port and does not use the host network; afterwards, that the running container
+  publishes none either (`docker inspect`).
+- Which TCP ports are already in use on the server, shown for the record (`ss`); bwwatch uses none of them and adds none.
+- `ufw`: if it is installed and you run the installer as root, it reads `ufw status verbose` — and *only* that;
+  it never runs `allow`, `deny`, `enable`, `reload` or anything else. It warns if ufw denies outgoing connections
+  (the one thing that could get in the way) and notes if `firewalld` is active. Without root it says so and skips.
+- Whether the container really can reach Bradford White is tested in the guided setup, from *inside* the container —
+  the real path, whatever the firewall rules say.
+
+**What a firewall must allow:** outgoing TCP 443 (HTTPS) and DNS from the server, to `consumer.bradfordwhiteapps.com`,
+`gw.prdapi.bradfordwhiteapps.com` and your alert service (`ntfy.sh`, Telegram, your mail server…). That is the default
+on a normal ufw setup. **Nothing inbound is needed**, and because nothing is published there is also nothing for
+Docker to punch through ufw (Docker's published ports bypass ufw — a common surprise — but bwwatch publishes none).
+
+**What it adds to the server's networking:** one private Docker network, `bwwatch_default`, which Docker gives a free
+address range that does not overlap one already in use; `./install.sh --uninstall` removes it, and an install you
+abandon before it starts removes it too. No other network, no firewall rule of its own, no change to Docker's settings.
+
+---
+
 ## Everything stays in `/opt/bwheater`
 
 The installer and `bwctl` work only inside the folder they live in. They never write anywhere else on the server —
@@ -104,7 +137,7 @@ working directory must still be empty.)
 | `/opt/bwheater/data/` | the database, daily backups, the sign-in token, a small rotating log (`logs/`) — about 0.3 MB after the first poll |
 | `/opt/bwheater/install.log` | what the installer did (no secrets) |
 | `.install.out`, `.env.new` | scratch files that exist only while the installer runs |
-| **Docker's own storage** (`/var/lib/docker`) | the image `bwwatch:local` and the container `bwwatch`; the container's log is capped at 3 × 10 MB. The Python base image it is built on is cached there too, shared with anything else that uses it |
+| **Docker's own storage** (`/var/lib/docker`) | the image `bwwatch:local`, the container `bwwatch` and one private Docker network, `bwwatch_default` (removed again by the uninstall); the container's log is capped at 3 × 10 MB. The Python base image it is built on is cached there too, shared with anything else that uses it |
 
 It never touches any other container, image, volume or network on the server: every Docker command is pinned to the
 project `bwwatch` and the folder it lives in (`docker compose -p bwwatch -f /opt/bwheater/docker-compose.yml …`), it
@@ -471,7 +504,8 @@ started*. Faults are priority 4 by default (`FAULT_PRIORITY`).
 - **The build fails.** Almost always the server couldn't download the Python base image: check DNS and internet access
   on the server, or Docker Hub's download limit; try again later. The full output is in `install.log`.
 - **"Could not reach the Wave sign-in server."** Check the server's internet connection and DNS, its clock (a wrong date
-  breaks HTTPS) and any firewall or proxy rules.
+  breaks HTTPS) and any firewall or proxy rules — the installer's firewall report (Part 1) may already have pointed at
+  one (for example *"ufw denies outgoing connections by default"*). Only outgoing HTTPS and DNS are needed.
 - **The sign-in paste is rejected.** The code in that address works once and expires within minutes. At the prompt type
   `new` for a fresh link, sign in again, and paste the new address promptly.
 - **The test alert doesn't arrive.** The setup offers to resend it, change the settings, or skip. For ntfy the topic in
