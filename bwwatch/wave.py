@@ -468,15 +468,22 @@ class TokenManager:
         refresh_token = self._current_refresh_token()
         if not refresh_token:
             raise AuthError("not signed in yet. Run: docker compose run --rm bwwatch login")
-        tokens = self._post_token(
-            {
-                "grant_type": "refresh_token",
-                "client_id": self.cfg.client_id,
-                "refresh_token": refresh_token,
-                "scope": self.cfg.scope,
-            },
-            "token refresh",
-        )
+        try:
+            tokens = self._post_token(
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": self.cfg.client_id,
+                    "refresh_token": refresh_token,
+                    "scope": self.cfg.scope,
+                },
+                "token refresh",
+            )
+        except AuthError as exc:
+            if self.cfg.username and self.cfg.password:
+                log.info("saved refresh token was rejected (%s); attempting automated re-login with credentials from .env", exc)
+                self.login_with_credentials()
+                return
+            raise
         rotated = tokens.get("refresh_token")
         if rotated and rotated != refresh_token:
             # Save BEFORE using anything from this response: the old token may now be dead.
