@@ -47,7 +47,7 @@ running() {
 }
 
 usage() {
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
   printf '\nAnything else is passed to bwwatch itself:  bwctl <command> --help\n'
 }
 
@@ -96,7 +96,10 @@ case $cmd in
   sync)
     need_ready
     if ! command -v rclone >/dev/null 2>&1; then
-      die "rclone is not installed. Install it on your VPS with: curl https://rclone.org/install.sh | sudo bash"
+      die "rclone is not installed. To set up optional Dropbox sync, run:  $DIR/setup-rclone.sh"
+    fi
+    if ! rclone listremotes 2>/dev/null | grep -q '^dropbox:'; then
+      die "Remote 'dropbox:' is not configured in rclone. To set it up, run:  $DIR/setup-rclone.sh"
     fi
     mkdir -p "$DIR/data/backups" "$DIR/data/exports"
     chmod 777 "$DIR/data/backups" "$DIR/data/exports" 2>/dev/null || true

@@ -28,6 +28,7 @@ run_cmd() {
     10) "$BWCTL" logs -f ;;
     11) "$BWCTL" restart ;;
     12) "$BWCTL" update ;;
+    13) "$DIR/setup-rclone.sh" ;;
     0|q|Q|exit) exit 0 ;;
     *)  printf "Invalid selection: %s\n" "$1"; return 1 ;;
   esac
@@ -57,20 +58,21 @@ while true; do
   printf ' 10) View Live Logs       (Follow real-time service logs, Ctrl+C exits)\n'
   printf ' 11) Restart Watcher      (Restart container & re-read .env)\n'
   printf ' 12) Update Watcher       (Rebuild & update container with latest code)\n'
+  printf ' 13) Setup Dropbox Sync   (Guided setup for optional rclone cloud backup)\n'
   printf '  0) Exit\n'
   printf '========================================================================\n'
-  printf 'Select an option [0-12]: '
+  printf 'Select an option [0-13]: '
   read -r choice || break
   case "$choice" in
     0|q|Q|exit) break ;;
-    [1-9]|10|11|12)
+    [1-9]|10|11|12|13)
       printf '\n'
       run_cmd "$choice"
       printf '\nPress Enter to return to menu...'
       read -r _dummy
       ;;
     *)
-      printf '\nInvalid choice. Please pick a number from 0 to 12.\n'
+      printf '\nInvalid choice. Please pick a number from 0 to 13.\n'
       sleep 1
       ;;
   esac
