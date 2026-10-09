@@ -338,6 +338,14 @@ def _is_active_key(path: str) -> bool:
     return norm_key(path.split(".")[-1]) in ACTIVE_LIST_KEYS
 
 
+def find_active_lists(payload: Any, list_path: Optional[str] = None) -> List[Tuple[str, list]]:
+    """Named active lists (such as `active_errors`) found in a fault response."""
+    if list_path:
+        return []
+    items, where = find_event_list(payload, list_path)
+    return [(key, lst) for key, lst in _named_lists(payload) if _is_active_key(key) and key != where]
+
+
 def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[FaultEvent]], str]:
     """Entries found in a fault response, or ``(None, why)`` if it has no recognisable list.
 
@@ -346,9 +354,7 @@ def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[Faul
     entry itself does not already say.
     """
     items, where = find_event_list(payload, opts.list_path)
-    active: List[Tuple[str, list]] = []
-    if not opts.list_path:
-        active = [(key, lst) for key, lst in _named_lists(payload) if _is_active_key(key) and key != where]
+    active: List[Tuple[str, list]] = find_active_lists(payload, opts.list_path)
     if items is None and not active:
         return None, where
 

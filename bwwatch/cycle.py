@@ -18,7 +18,7 @@ from . import observe
 from .config import Config, RequestSpec
 from .db import meta_get, meta_set, savepoint, tx
 from .errors import AuthError, WaveError
-from .faults import FaultEvent, digest, extract_events, scan_state
+from .faults import FaultEvent, digest, extract_events, find_active_lists, normalize_event, scan_state
 from .notify import Message, Notifier
 from .readings import extract_reading, reading_changes, reading_from_row
 from .util import hours_since, iso, local_time, parse_iso, scrub, truncate
@@ -576,6 +576,34 @@ def _record_fault_payload(
             if not history:
                 created.append(NewFault(int(cur.lastrowid), mac, name, "event", ev.code, ev.description, ev.occurred_at,
                                         state=ev.state, cleared_at=ev.cleared_at))
+
+        active_lists = find_active_lists(payload, cfg.fault_options.list_path)
+        if active_lists:
+            active_codes = set()
+            active_fps = set()
+            for _k, lst in active_lists:
+                for item in lst:
+                    if isinstance(item, dict):
+                        a_ev = normalize_event(item, cfg.fault_options)
+                        if a_ev.code:
+                            active_codes.add(a_ev.code)
+                        active_fps.add(a_ev.fingerprint)
+            open_active = conn.execute(
+                "SELECT id, fingerprint, code, description, occurred_at, first_seen_at, last_seen_at, state "
+                "FROM faults WHERE mac = ? AND kind = 'event' AND state = 'active'",
+                (mac,),
+            ).fetchall()
+            for r in open_active:
+                if (r["code"] is None or r["code"] not in active_codes) and r["fingerprint"] not in active_fps:
+                    conn.execute(
+                        "UPDATE faults SET state = 'cleared', cleared_seen_at = ?, last_seen_at = ? WHERE id = ?",
+                        (now, now, r["id"]),
+                    )
+                    outcome.cleared += 1
+                    if cfg.notify_cleared and not first:
+                        title, body = cleared_alert(cfg, name, mac, r, None, now)
+                        enqueue(conn, kind="cleared", title=title, body=body, priority=3, now=now, fault_id=r["id"])
+
         if first:
             notes.append(_baseline_history_note(events, cfg.display_tz))
     if first:

@@ -228,6 +228,28 @@ class ClearedFaults(CycleCase):
         self.assertEqual(len(out.new_faults), 1)
         self.assertEqual(self.count("faults", "WHERE kind = 'event'"), 2)
 
+    def test_active_error_clears_when_active_errors_becomes_empty(self):
+        self.mock.notifications = {"error_history": [], "active_errors": []}
+        self.poll()
+
+        self.mock.notifications = {
+            "error_history": [],
+            "active_errors": [{"FaultCode": 10, "title": "Superheat Fault", "timestamp": "2026-10-09T17:30:00Z"}],
+        }
+        out1 = self.poll()
+        self.assertEqual(len(out1.new_faults), 1)
+        self.assertEqual(self.faults()[0]["state"], "active")
+
+        # The fault physically clears: active_errors is now empty, and error_history only lists past events
+        self.mock.notifications = {
+            "error_history": [{"FaultCode": 10, "title": "(Cleared) Superheat Fault", "timestamp": "2026-10-07T17:37:00Z"}],
+            "active_errors": [],
+        }
+        out2 = self.poll()
+        self.assertEqual(out2.cleared, 1)
+        self.assertEqual(self.faults()[0]["state"], "cleared")
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 cleared — Basement")
+
     def test_the_log_commands_show_what_happened(self):
         import argparse
         import contextlib
