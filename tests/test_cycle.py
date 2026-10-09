@@ -250,6 +250,82 @@ class ClearedFaults(CycleCase):
         self.assertEqual(self.faults()[0]["state"], "cleared")
         self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 cleared — Basement")
 
+    def test_active_error_clears_when_active_errors_is_none_or_empty_dict(self):
+        self.mock.notifications = {"error_history": [], "active_errors": []}
+        self.poll()
+
+        self.mock.notifications = {
+            "error_history": [],
+            "active_errors": [{"FaultCode": 10, "title": "Superheat Fault"}],
+        }
+        self.poll()
+        self.assertEqual(self.faults()[0]["state"], "active")
+
+        # active_errors as null / None
+        self.mock.notifications = {"error_history": [], "active_errors": None}
+        out = self.poll()
+        self.assertEqual(out.cleared, 1)
+        self.assertEqual(self.faults()[0]["state"], "cleared")
+
+    def test_multiple_active_faults_one_clears_one_remains(self):
+        self.mock.notifications = {"error_history": [], "active_errors": []}
+        self.poll()
+
+        self.mock.notifications = {
+            "error_history": [],
+            "active_errors": [
+                {"FaultCode": 10, "title": "Superheat Fault"},
+                {"FaultCode": 12, "title": "Compressor Fault"},
+            ],
+        }
+        out = self.poll()
+        self.assertEqual(len(out.new_faults), 2)
+        self.assertEqual(self.count("faults", "WHERE state = 'active'"), 2)
+
+        # Fault 10 clears, Fault 12 remains active
+        self.mock.notifications = {
+            "error_history": [],
+            "active_errors": [{"FaultCode": 12, "title": "Compressor Fault"}],
+        }
+        out = self.poll()
+        self.assertEqual(out.cleared, 1)
+        self.assertEqual(self.count("faults", "WHERE state = 'active'"), 1)
+        self.assertEqual(self.count("faults", "WHERE state = 'cleared'"), 1)
+        self.assertEqual(self.delivered()[-1]["title"], "Water heater fault 10 cleared — Basement")
+
+    def test_active_errors_only_payload_without_error_history(self):
+        self.mock.notifications = {"active_errors": [{"FaultCode": 10, "title": "Superheat Fault"}]}
+        self.poll()
+        self.assertEqual(self.faults()[0]["state"], "active")
+
+        # Now active_errors becomes empty
+        self.mock.notifications = {"active_errors": []}
+        out = self.poll()
+        self.assertEqual(out.cleared, 1)
+        self.assertEqual(self.faults()[0]["state"], "cleared")
+
+    def test_active_error_code_with_leading_zeros_or_scalar_items(self):
+        # Even if multiple active faults with different representations accumulated:
+        # Row 1: dict with FaultCode 10
+        self.mock.notifications = {"active_errors": [{"FaultCode": "10", "title": "Superheat Fault"}]}
+        self.poll()
+        self.assertEqual(self.faults()[0]["state"], "active")
+
+        # Row 2: scalar int 10
+        self.mock.notifications = {"active_errors": [10]}
+        self.poll()
+
+        # Both remain active while 10 is present in active_errors
+        self.mock.notifications = {"active_errors": ["010"]}
+        self.poll()
+        self.assertEqual(self.count("faults", "WHERE state = 'active'"), 3)
+
+        # When active_errors empties, ALL accumulated open active faults clear safely
+        self.mock.notifications = {"active_errors": []}
+        out = self.poll()
+        self.assertEqual(out.cleared, 3)
+        self.assertEqual(self.count("faults", "WHERE state = 'active'"), 0)
+
     def test_the_log_commands_show_what_happened(self):
         import argparse
         import contextlib

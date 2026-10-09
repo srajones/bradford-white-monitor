@@ -18,7 +18,7 @@ from . import observe
 from .config import Config, RequestSpec
 from .db import meta_get, meta_set, savepoint, tx
 from .errors import AuthError, WaveError
-from .faults import FaultEvent, digest, extract_events, find_active_lists, normalize_event, scan_state
+from .faults import CODE_KEYS, FaultEvent, digest, extract_events, find_active_lists, normalize_event, scan_state
 from .notify import Message, Notifier
 from .readings import extract_reading, reading_changes, reading_from_row
 from .util import hours_since, iso, local_time, parse_iso, scrub, truncate
@@ -583,18 +583,33 @@ def _record_fault_payload(
             active_fps = set()
             for _k, lst in active_lists:
                 for item in lst:
+                    a_ev = normalize_event(item, cfg.fault_options)
+                    if a_ev.code:
+                        code_str = str(a_ev.code).strip()
+                        active_codes.add(code_str)
+                        active_codes.add(code_str.lstrip("0") or "0")
+                    active_fps.add(a_ev.fingerprint)
                     if isinstance(item, dict):
-                        a_ev = normalize_event(item, cfg.fault_options)
-                        if a_ev.code:
-                            active_codes.add(a_ev.code)
-                        active_fps.add(a_ev.fingerprint)
+                        for k in CODE_KEYS:
+                            v = item.get(k)
+                            if v is not None and v != "":
+                                v_str = str(v).strip()
+                                active_codes.add(v_str)
+                                active_codes.add(v_str.lstrip("0") or "0")
             open_active = conn.execute(
                 "SELECT id, fingerprint, code, description, occurred_at, first_seen_at, last_seen_at, state "
                 "FROM faults WHERE mac = ? AND kind = 'event' AND state = 'active'",
                 (mac,),
             ).fetchall()
             for r in open_active:
-                if (r["code"] is None or r["code"] not in active_codes) and r["fingerprint"] not in active_fps:
+                r_code = r["code"]
+                code_matches = False
+                if r_code is not None:
+                    r_str = str(r_code).strip()
+                    r_norm = r_str.lstrip("0") or "0"
+                    code_matches = (r_str in active_codes) or (r_norm in active_codes)
+                fp_matches = r["fingerprint"] in active_fps
+                if not code_matches and not fp_matches:
                     conn.execute(
                         "UPDATE faults SET state = 'cleared', cleared_seen_at = ?, last_seen_at = ? WHERE id = ?",
                         (now, now, r["id"]),

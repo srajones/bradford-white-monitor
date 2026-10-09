@@ -48,7 +48,11 @@ PREFERRED_LIST_KEYS = (
 )
 # The app also has ApplianceActiveError / `active_errors`: the fault that is happening right now,
 # separate from the history list. Entries found only there are treated as active.
-ACTIVE_LIST_KEYS = ("activeerrors", "activeerror", "applianceactiveerrors", "applianceactiveerror")
+ACTIVE_LIST_KEYS = (
+    "activeerrors", "activeerror", "applianceactiveerrors", "applianceactiveerror",
+    "activefaults", "activefault", "applianceactivefaults", "applianceactivefault",
+    "activealerts", "activealarms", "currenterrors", "currentfaults", "currenterror", "currentfault",
+)
 
 
 def _dig(payload: Any, path: str) -> Any:
@@ -259,7 +263,16 @@ def looks_unique(ident: Optional[str]) -> bool:
 def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
     if not isinstance(item, dict):
         text = truncate(str(item), 300)
-        return FaultEvent("h:" + digest(item)[:32], None, text, None, json.dumps(item, default=str, ensure_ascii=False))
+        code = None
+        if isinstance(item, int):
+            code = str(item)
+        elif isinstance(item, str):
+            found = FAULT_NUMBER.search(item)
+            if found:
+                code = found.group(1)
+            elif item.strip().isdigit():
+                code = item.strip()
+        return FaultEvent("h:" + digest(item)[:32], code, text, None, json.dumps(item, default=str, ensure_ascii=False))
     flat = _flatten(item)
     raw_json = json.dumps(item, default=str, ensure_ascii=False, sort_keys=True)
 
@@ -340,10 +353,47 @@ def _is_active_key(path: str) -> bool:
 
 def find_active_lists(payload: Any, list_path: Optional[str] = None) -> List[Tuple[str, list]]:
     """Named active lists (such as `active_errors`) found in a fault response."""
-    if list_path:
-        return []
-    items, where = find_event_list(payload, list_path)
-    return [(key, lst) for key, lst in _named_lists(payload) if _is_active_key(key) and key != where]
+    found: List[Tuple[str, list]] = []
+    if list_path and _is_active_key(list_path):
+        target = _dig(payload, list_path)
+        if isinstance(target, list):
+            found.append((list_path, target))
+        elif target is None or target == "" or target is False:
+            found.append((list_path, []))
+        elif isinstance(target, dict):
+            if any(norm_key(k) in CODE_KEYS for k in target):
+                found.append((list_path, [target]))
+            else:
+                found.append((list_path, []))
+
+    def scan(obj: Any, prefix: str = "", depth: int = 0) -> None:
+        if not isinstance(obj, dict) or depth > 3:
+            return
+        for key, val in obj.items():
+            path = "%s.%s" % (prefix, key) if prefix else str(key)
+            if _is_active_key(path):
+                if isinstance(val, list):
+                    found.append((path, val))
+                elif val is None or val == "" or val is False:
+                    found.append((path, []))
+                elif isinstance(val, dict):
+                    if any(norm_key(k) in CODE_KEYS for k in val):
+                        found.append((path, [val]))
+                    elif not val:
+                        found.append((path, []))
+                    else:
+                        scan(val, path, depth + 1)
+            elif isinstance(val, dict):
+                scan(val, path, depth + 1)
+
+    scan(payload)
+    seen_keys = set()
+    deduped: List[Tuple[str, list]] = []
+    for k, lst in found:
+        if k not in seen_keys:
+            seen_keys.add(k)
+            deduped.append((k, lst))
+    return deduped
 
 
 def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[FaultEvent]], str]:
@@ -354,8 +404,9 @@ def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[Faul
     entry itself does not already say.
     """
     items, where = find_event_list(payload, opts.list_path)
-    active: List[Tuple[str, list]] = find_active_lists(payload, opts.list_path)
-    if items is None and not active:
+    all_active: List[Tuple[str, list]] = find_active_lists(payload, opts.list_path)
+    active = [(k, lst) for k, lst in all_active if k != where]
+    if items is None and not all_active:
         return None, where
 
     by_fp: Dict[str, FaultEvent] = {}
@@ -384,7 +435,7 @@ def extract_events(payload: Any, opts: FaultOptions) -> Tuple[Optional[List[Faul
     for _key, lst in active:
         for item in lst:
             add(item, True)
-    return [by_fp[fp] for fp in order], where or (active[0][0] if active else where)
+    return [by_fp[fp] for fp in order], where or (all_active[0][0] if all_active else where)
 
 
 # --- fault flags inside status payloads -------------------------------------
