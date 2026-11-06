@@ -5,6 +5,7 @@
 [![Read-Only Enforced](https://img.shields.io/badge/safety-100%25%20read--only%20enforced-success.svg)](bwwatch/readonly.py)
 [![Home Assistant](https://img.shields.io/badge/home%20assistant-webhook%20ready-41bdf5.svg)](#home-assistant-integration)
 [![Zero Ports](https://img.shields.io/badge/inbound%20ports-none%20(0)-lightgrey.svg)](#ports-firewall-and-network-security)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/srajones)
 
 An always-on, ultra-lightweight Docker monitoring service for **Bradford White Aerotherm® and Aerotherm® G2** hybrid electric heat pump water heaters (and any water heater connected to the **Bradford White Wave mobile app**).
 
@@ -523,6 +524,16 @@ The test suite runs against mock Wave cloud servers and mock alert endpoints, va
 - Alert delivery retries and webhook formatting.
 - Endpoint discovery probes (about 14 test cases).
 - Script confinement and installer verification.
+
+---
+
+## Support the Project
+
+If `bwwatch` saved your hot water, caught a heat-pump fault early, or saved you from a surprise electric bill, consider buying me a coffee!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/☕_Buy_Me_a_Coffee-srajones-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/srajones)
+
+- **Buy Me a Coffee:** [https://buymeacoffee.com/srajones](https://buymeacoffee.com/srajones)
 
 ---
 
