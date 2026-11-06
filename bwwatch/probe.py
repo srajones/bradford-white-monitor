@@ -42,7 +42,16 @@ def run_probe(
     items = api.list_appliances()
     if not items:
         raise WaveError("the account has no appliances")
-    ctx = {"mac": str(items[0].get("macAddress") or ""), "serial": "", "name": ""}
+    matching = [
+        it for it in items
+        if api.cfg.matches_appliance(
+            str(it.get("macAddress") or it.get("mac_address") or it.get("mac") or ""),
+            str(it.get("friendlyName") or ""),
+            str(it.get("serialNumber") or ""),
+        )
+    ]
+    chosen = matching[0] if matching else items[0]
+    ctx = {"mac": str(chosen.get("macAddress") or chosen.get("mac_address") or chosen.get("mac") or ""), "serial": "", "name": ""}
 
     def ask(name: str) -> HttpResponse:
         spec = RequestSpec.parse("GET /wave/%s?username={account_id}&macAddress={mac}" % name, label="probe")

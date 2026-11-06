@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from . import __version__, views
-from .config import Config, ConfigError, RequestSpec, load_env_file
-from .cycle import apply_cycle, deliver_outbox, describe_event, enqueue, fetch
+from .config import Config, ConfigError, RequestSpec, load_env_file, monitored_macs, save_selected_appliances
+from .cycle import ACCOUNT, apply_cycle, deliver_outbox, describe_event, enqueue, fetch, mac_of
 from .db import DB_NAME, DatabaseTooNew, backup_now, connect, init_schema, integrity_check, list_backups, open_database, table_counts, tx
 from .discover import CANDIDATES, forget, load, try_candidates
 from .errors import AuthError, WaveError
@@ -233,6 +233,8 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     account = tokens.account_id or "?"
     print("Sign-in:  OK (account %s)" % (account[:8] + "..." if len(account) > 8 else account))
     print("Read-only: this tool only sends read requests; it cannot change any setting on the heater.")
+    if cfg.selected_appliances:
+        print("Appliance filter: %s" % ", ".join(cfg.selected_appliances))
     print("Appliances found: %d" % len(fetched.appliances))
     for a in fetched.appliances:
         print("\n  %s   mac=%s  serial=%s  type=%s" % (a.name, a.mac, a.serial or "-", a.model or "-"))
@@ -313,7 +315,7 @@ def _print_fault_check(cfg: Config, payload: Any, indent: str) -> int:
 
 
 # --- call / probe -----------------------------------------------------------
-def _resolve_ctx(api: WaveApi, spec: RequestSpec, mac: Optional[str]) -> Dict[str, str]:
+def _resolve_ctx(api: WaveApi, spec: RequestSpec, mac: Optional[str], cfg: Optional[Config] = None) -> Dict[str, str]:
     if not (spec.placeholders() - {"account_id"}):
         return {}
     if mac:
@@ -321,6 +323,17 @@ def _resolve_ctx(api: WaveApi, spec: RequestSpec, mac: Optional[str]) -> Dict[st
     first = api.list_appliances()
     if not first:
         raise WaveError("the account has no appliances to fill {mac} from")
+    if cfg is not None and cfg.selected_appliances:
+        matched = [
+            it for it in first
+            if cfg.matches_appliance(
+                mac_of(it),
+                str(it.get("friendlyName") or it.get("name") or ""),
+                str(it.get("serialNumber") or it.get("serial") or ""),
+            )
+        ]
+        if matched:
+            first = matched
     item = first[0]
     ctx = {
         "mac": str(item.get("macAddress") or ""),
@@ -336,7 +349,7 @@ def cmd_call(cfg: Config, args: argparse.Namespace) -> int:
     spec = RequestSpec.parse(args.request, label="request")  # refuses anything that could change the heater
     _store, _tokens, api = _make_api(cfg)
     try:
-        ctx = _resolve_ctx(api, spec, args.mac)
+        ctx = _resolve_ctx(api, spec, args.mac, cfg=cfg)
         payload = api.call(spec, ctx)
     except WaveError as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -373,12 +386,15 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
     print("Service:         %s" % (("running - " + message) if ok else ("NOT running / unhealthy - " + message)))
     print("Poll interval:   every %d minutes" % (cfg.interval // 60))
     print("Alert channels:  %s" % (", ".join(cfg.channel_names) or "NONE"))
+    selected = cfg.selected_appliances
+    print("Monitored:       %s" % ((", ".join(selected) + "  (./bwctl heaters to change)") if selected else "all water heaters  (./bwctl heaters to filter)"))
     print("Fault history:   %s" % (cfg.fault_request.describe() if cfg.fault_request else "NOT configured in .env (bwwatch can learn it; ./bwctl discover)"))
     conn = _open_existing_db(cfg)
     if conn is None:
         print("Database:        none yet")
         return 0
     try:
+        monitored = monitored_macs(conn, cfg)
         poll = conn.execute("SELECT * FROM polls ORDER BY id DESC LIMIT 1").fetchone()
         if poll:
             print("Last poll:       %s - %s" % (local_time(poll["finished_at"], cfg.display_tz), "ok" if poll["ok"] else "FAILED: %s" % poll["error"]))
@@ -391,21 +407,37 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
         if cfg.fault_request is None and learned is not None:
             print("Learned request: %s" % learned.describe())
         print("\nHeaters:")
-        for row in conn.execute("SELECT * FROM appliances ORDER BY name"):
+        all_rows = conn.execute("SELECT * FROM appliances ORDER BY name").fetchall()
+        shown_rows = [row for row in all_rows if monitored is None or row["mac"] in monitored]
+        for row in shown_rows:
             reading = conn.execute("SELECT * FROM readings WHERE mac = ? ORDER BY id DESC LIMIT 1", (row["mac"],)).fetchone()
             line = "  %s (%s)" % (row["name"], row["mac"])
             if reading:
                 line += "  %s   [as of %s]" % (reading_from_row(reading).summary(), local_time(reading["taken_at"], cfg.display_tz))
             print(line)
-        opened = conn.execute("SELECT * FROM faults WHERE kind = 'state' AND cleared_at IS NULL").fetchall()
+        ignored_count = len(all_rows) - len(shown_rows)
+        if ignored_count > 0:
+            print("  (%d other heater%s on account ignored; run ./bwctl heaters to change)" % (ignored_count, "s" if ignored_count != 1 else ""))
+        opened = [
+            r for r in conn.execute("SELECT * FROM faults WHERE kind = 'state' AND cleared_at IS NULL").fetchall()
+            if monitored is None or r["mac"] in monitored or r["mac"] == ACCOUNT
+        ]
         print("\nFault-like fields active now: %s" % (", ".join("%s=%s" % (r["description"], r["code"]) for r in opened) or "none"))
-        active = conn.execute("SELECT * FROM faults WHERE kind = 'event' AND state = 'active' ORDER BY first_seen_at").fetchall()
+        active = [
+            r for r in conn.execute("SELECT * FROM faults WHERE kind = 'event' AND state = 'active' ORDER BY first_seen_at").fetchall()
+            if monitored is None or r["mac"] in monitored or r["mac"] == ACCOUNT
+        ]
         print("Active fault entries: %s" % ("; ".join(
             "code %s %s (since %s)" % (r["code"] or "-", truncate(r["description"] or "", 40), local_time(r["occurred_at"] or r["first_seen_at"], cfg.display_tz))
             for r in active) or "none"))
-        total, new = conn.execute("SELECT COUNT(*), COALESCE(SUM(1 - baseline), 0) FROM faults").fetchone()
+        all_faults = [
+            r for r in conn.execute("SELECT id, mac, baseline, first_seen_at, code, description FROM faults ORDER BY id DESC").fetchall()
+            if monitored is None or r["mac"] in monitored or r["mac"] == ACCOUNT
+        ]
+        total = len(all_faults)
+        new = sum(1 for r in all_faults if not r["baseline"])
         print("Faults logged:   %d (%d seen since monitoring began, %d pre-existing)" % (total, new, total - new))
-        latest = conn.execute("SELECT * FROM faults WHERE baseline = 0 ORDER BY id DESC LIMIT 3").fetchall()
+        latest = [r for r in all_faults if not r["baseline"]][:3]
         for row in latest:
             print("  - %s  code %s  %s" % (local_time(row["first_seen_at"], cfg.display_tz), row["code"] or "-", truncate(row["description"] or "", 70)))
         pending = conn.execute("SELECT COUNT(*) FROM outbox WHERE status = 'pending'").fetchone()[0]
@@ -423,14 +455,17 @@ def cmd_faults(cfg: Config, args: argparse.Namespace) -> int:
         print("No database yet - has the service run?")
         return 1
     try:
-        limit = -1 if args.all else args.limit
+        monitored = monitored_macs(conn, cfg)
         rows = conn.execute(
             """SELECT f.*, a.name AS appliance,
                       (SELECT o.status FROM outbox o WHERE o.fault_id = f.id ORDER BY o.id DESC LIMIT 1) AS alert
                FROM faults f LEFT JOIN appliances a ON a.mac = f.mac
-               ORDER BY COALESCE(f.occurred_at, f.first_seen_at) DESC, f.id DESC LIMIT ?""",
-            (limit,),
+               ORDER BY COALESCE(f.occurred_at, f.first_seen_at) DESC, f.id DESC"""
         ).fetchall()
+        if monitored is not None:
+            rows = [r for r in rows if r["mac"] in monitored or r["mac"] == ACCOUNT]
+        if not args.all and args.limit > 0:
+            rows = rows[: args.limit]
         if not rows:
             print("No faults logged yet.")
             return 0
@@ -489,12 +524,17 @@ def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
                   "LEFT JOIN appliances a ON a.mac = e.mac ORDER BY e.ts",
     }
     try:
+        monitored = monitored_macs(conn, cfg) if args.table != "polls" else None
         cursor = conn.execute(queries[args.table])
         out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
         try:
             writer = csv.writer(out)
             writer.writerow([d[0] for d in cursor.description])
             for row in cursor:
+                if monitored is not None:
+                    mac = row["mac"]
+                    if mac not in monitored and not (args.table == "faults" and mac == ACCOUNT):
+                        continue
                 writer.writerow([_csv_safe(v) for v in tuple(row)])
         finally:
             if args.out:
@@ -605,6 +645,168 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return wizard.Wizard(wizard.Console(), os.environ, data_dir, template).run()
 
 
+def _collect_known_heaters(cfg: Config) -> list[dict[str, str]]:
+    """Gather all water heaters from the Wave cloud (if signed in) and the local database."""
+    by_mac: dict[str, dict[str, str]] = {}
+    _store, tokens, api = _make_api(cfg)
+    if tokens.has_credentials():
+        try:
+            for item in api.list_appliances():
+                mac = mac_of(item)
+                if not mac:
+                    continue
+                by_mac[mac.lower()] = {
+                    "mac": mac,
+                    "name": str(item.get("friendlyName") or item.get("name") or mac),
+                    "serial": str(item.get("serialNumber") or item.get("serial") or ""),
+                    "model": str(item.get("applianceType") or item.get("model") or ""),
+                    "reading": "",
+                }
+        except WaveError as exc:
+            print("(note: could not reach Wave API right now (%s); using saved database list)" % exc, file=sys.stderr)
+    conn = _open_existing_db(cfg)
+    if conn is not None:
+        try:
+            for row in conn.execute("SELECT * FROM appliances ORDER BY name"):
+                mac = str(row["mac"] or "")
+                if not mac:
+                    continue
+                key = mac.lower()
+                if key not in by_mac:
+                    by_mac[key] = {
+                        "mac": mac,
+                        "name": str(row["name"] or mac),
+                        "serial": str(row["serial"] or ""),
+                        "model": str(row["model"] or ""),
+                        "reading": "",
+                    }
+                reading = conn.execute(
+                    "SELECT * FROM readings WHERE mac = ? ORDER BY id DESC LIMIT 1", (mac,)
+                ).fetchone()
+                if reading:
+                    by_mac[key]["reading"] = "%s [as of %s]" % (
+                        reading_from_row(reading).summary(),
+                        local_time(reading["taken_at"], cfg.display_tz),
+                    )
+        finally:
+            conn.close()
+    return list(by_mac.values())
+
+
+def _resolve_heater_choice(raw: str, heaters: list[dict[str, str]]) -> tuple[Optional[list[str]], Optional[str]]:
+    """Parse user selection ('all', '1', '1,2', '1,2,3', or MAC/serial/name) into a list of canonical identifiers."""
+    text = raw.strip()
+    if text.lower() in ("all", "a", "*"):
+        return [], None
+    tokens = [t.strip() for t in re.split(r"[,;]+|\s+", text) if t.strip() and "," in text or ";" in text]
+    if not tokens:
+        tokens = [t.strip() for t in re.split(r"[,;\s]+", text) if t.strip()]
+    # If the user typed a multi-word friendly name without commas (and not all digits), try matching the full string first
+    if "," not in text and ";" not in text and not all(t.isdigit() for t in tokens):
+        low = text.lower()
+        for h in heaters:
+            if low in (h["mac"].lower(), h["serial"].lower(), h["name"].lower()):
+                return [h["mac"]], None
+    chosen: list[str] = []
+    for tok in tokens:
+        if tok.isdigit():
+            idx = int(tok)
+            if not heaters:
+                return None, "No numbered water heaters are listed yet; enter a MAC address or 'all'."
+            if idx < 1 or idx > len(heaters):
+                return None, "Invalid heater number %d (choose between 1 and %d, or 'all')." % (idx, len(heaters))
+            mac = heaters[idx - 1]["mac"]
+            if mac not in chosen:
+                chosen.append(mac)
+        else:
+            low = tok.lower()
+            matched_mac = None
+            for h in heaters:
+                if low in (h["mac"].lower(), h["serial"].lower(), h["name"].lower()):
+                    matched_mac = h["mac"]
+                    break
+            val = matched_mac or tok
+            if val not in chosen:
+                chosen.append(val)
+    return chosen, None
+
+
+def cmd_heaters(cfg: Config, args: argparse.Namespace) -> int:
+    """List water heaters on the account and choose which one(s) to monitor (1, 2, 3, or all)."""
+    heaters = _collect_known_heaters(cfg)
+    selected = cfg.selected_appliances
+    print("Water heaters on this account: %d" % len(heaters))
+    if not heaters:
+        print("  (none found yet - run ./bwctl login or ./bwctl check first)")
+    else:
+        for i, h in enumerate(heaters, 1):
+            monitored = cfg.matches_appliance(h["mac"], h["name"], h["serial"])
+            badge = "MONITORED" if monitored else "IGNORED  "
+            details = "mac=%s" % h["mac"]
+            if h["serial"]:
+                details += "  serial=%s" % h["serial"]
+            if h["model"]:
+                details += "  type=%s" % h["model"]
+            print("  %d) [%s]  %s   (%s)" % (i, badge, h["name"], details))
+            if h["reading"]:
+                print("                 Last reading: %s" % h["reading"])
+    print("\nCurrent filter: %s" % (", ".join(selected) if selected else "all water heaters"))
+
+    select_arg = getattr(args, "select", None)
+    if getattr(args, "list_only", False) or (select_arg is None and not sys.stdin.isatty()):
+        return 0
+
+    if select_arg is not None:
+        chosen, err = _resolve_heater_choice(select_arg, heaters)
+        if err is not None or chosen is None:
+            print("error: %s" % (err or "invalid selection"), file=sys.stderr)
+            return 2
+    else:
+        print("\nSelect which water heater(s) to monitor:")
+        if heaters:
+            print("  - Enter number(s), e.g.  1  or  1,2  or  1,2,3")
+        print("  - Enter MAC address, serial number, or friendly name")
+        print("  - Enter 'all' to monitor every water heater on the account")
+        print("  - Press Enter to keep current selection")
+        while True:
+            try:
+                ans = input("Choice: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if not ans:
+                print("Keeping current selection (%s)." % (", ".join(selected) if selected else "all water heaters"))
+                return 0
+            chosen, err = _resolve_heater_choice(ans, heaters)
+            if err is None and chosen is not None:
+                break
+            print("  %s" % err)
+
+    env_val = os.environ.get("BW_APPLIANCES", "")
+    save_selected_appliances(cfg.data_dir, chosen, env_val)
+    # Also write .bw_appliances.env so ./bwctl on the host updates .env and recreates the container if running
+    sync_path = cfg.data_dir / ".bw_appliances.env"
+    try:
+        sync_path.write_text(",".join(chosen) + "\n", encoding="utf-8")
+        os.chmod(sync_path, 0o600)
+    except OSError:
+        pass
+
+    if not chosen:
+        print("\nSaved: monitoring ALL water heaters on this account.")
+    else:
+        names = []
+        for c in chosen:
+            label = c
+            for h in heaters:
+                if h["mac"].lower() == c.lower():
+                    label = "%s (%s)" % (h["name"], h["mac"])
+                    break
+            names.append(label)
+        print("\nSaved: monitoring %d water heater(s): %s" % (len(chosen), ", ".join(names)))
+    return 0
+
+
 def cmd_discover(cfg: Config, args: argparse.Namespace) -> int:
     """Show, forget, or force another try of the three /wave/getApplianceErrors forms."""
     conn, _recovery = open_database(cfg.data_dir)
@@ -630,7 +832,15 @@ def cmd_discover(cfg: Config, args: argparse.Namespace) -> int:
             if not items:
                 print("This account has no water heaters.")
                 return 1
-            item = items[0]
+            matched = [
+                it for it in items
+                if cfg.matches_appliance(
+                    mac_of(it),
+                    str(it.get("friendlyName") or it.get("name") or ""),
+                    str(it.get("serialNumber") or it.get("serial") or ""),
+                )
+            ]
+            item = (matched or items)[0]
             appliance = type("Heater", (), {
                 "mac": str(item.get("macAddress") or ""),
                 "serial": str(item.get("serialNumber") or ""),
@@ -682,6 +892,7 @@ COMMANDS: Dict[str, Callable[[Config, argparse.Namespace], int]] = {
     "run": cmd_run,
     "login": cmd_login,
     "check": cmd_check,
+    "heaters": cmd_heaters,
     "call": cmd_call,
     "probe": cmd_probe,
     "status": cmd_status,
@@ -716,6 +927,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_login = sub.add_parser("login", help="sign in to Wave and save the refresh token (supports automated login via .env)")
     p_login.add_argument("--auto", action="store_true", help="sign in automatically using credentials from .env without prompting")
     sub.add_parser("check", help="read everything once and show what bwwatch understands (writes nothing)")
+    p_heaters = sub.add_parser("heaters", help="list water heaters on the account and choose which one(s) to monitor")
+    p_heaters.add_argument("--list", dest="list_only", action="store_true", help="only list the water heaters without prompting")
+    p_heaters.add_argument("--select", metavar="heaters", help="set monitored heater(s) by number (1, 1,2), MAC, serial, name, or 'all'")
     sub.add_parser("poll", help="trigger an immediate manual poll and record everything to the database")
     p_rep = sub.add_parser("report", help="generate a Markdown report and CSV files (faults, readings, energy)")
     p_rep.add_argument("--out-dir", help="directory to save the report and CSVs (default: /data/exports)")

@@ -131,9 +131,10 @@ You don't need to remember Docker commands or syntax. Running `./bwctl` or `./bw
  11) Restart Watcher      (Restart container & re-read .env)
  12) Update Watcher       (Rebuild & update container with latest code)
  13) Setup Dropbox Sync   (Guided setup for optional rclone cloud backup)
+ 14) Select Water Heaters (Choose which water heater(s) to monitor)
   0) Exit
 ========================================================================
-Select an option [0-13]:
+Select an option [0-14]:
 ```
 
 ### Command-Line Reference (`./bwctl`)
@@ -144,6 +145,7 @@ You can run commands directly without the menu by passing arguments to `./bwctl`
 |---|---|
 | `menu` · `cheat` | Open the interactive numbered menu (`./bwctl menu` or `./bwctl cheat`) |
 | `status` | One-screen summary: health, last check, setpoint, mode, active faults, backups |
+| `heaters` `[--list] [--select ...]` | List water heaters on the account and choose which one(s) to monitor (1, 2, 3, or all) |
 | `poll` | Trigger an immediate manual poll and record results directly to SQLite |
 | `readings` | Chronological table of operating modes and setpoint temperatures |
 | `faults` `[--all] [--raw]` | List all recorded fault codes, occurrence dates, and cleared status |
@@ -169,7 +171,7 @@ You can run commands directly without the menu by passing arguments to `./bwctl`
 | `reconfigure` · `uninstall` | Shortcuts for `./install.sh --reconfigure` and `--uninstall` |
 | `help` | Display built-in command assistance |
 
-Under the hood, these map to the container's internal commands: `run`, `login`, `check`, `call`, `probe`, `status`, `faults`, `export`, `backup`, `dbcheck`, `test-notify`, `verify`, `fields`, `changes`, `calls`, `discover`, `energy`, `readings`, `poll`, `report`, `healthcheck`, `setup`, and `version`.
+Under the hood, these map to the container's internal commands: `run`, `login`, `check`, `heaters`, `call`, `probe`, `status`, `faults`, `export`, `backup`, `dbcheck`, `test-notify`, `verify`, `fields`, `changes`, `calls`, `discover`, `energy`, `readings`, `poll`, `report`, `healthcheck`, `setup`, and `version`.
 
 ---
 
@@ -444,11 +446,22 @@ SMTP_TO=me@example.com
 
 # --- Optional Fault History Request ---
 BW_FAULT_REQUEST='GET /wave/getApplianceErrors?mac_address={mac}'
+
+# --- Optional Water Heater Filter (Multi-Heater Accounts) ---
+# Leave blank to monitor all water heaters on the account, or specify one or more
+# by MAC address, serial number, or friendly name (comma-separated):
+# BW_APPLIANCES=00:22:a3:14:bf:6f
 ```
 
 ---
 
 ## Troubleshooting & FAQ
+
+### How do I choose which water heater(s) to monitor if my account has multiple heaters?
+If your Wave account has more than one water heater (for example, an older replaced tank is still listed on your account, or you have multiple heaters), you can choose to monitor 1, 2, 3, or all of them:
+- **Interactive Menu:** Run `./bwcheat` and choose option **`14) Select Water Heaters`**, or run `./bwctl heaters`. It will list all water heaters on your account (`1)`, `2)`, `3)`, ...) and let you pick `1`, `1,2`, `1,2,3`, or `all`.
+- **Direct CLI:** Run `./bwctl heaters --select 1` (or `./bwctl heaters --select 00:22:a3:14:bf:6f`, or `./bwctl heaters --select all`).
+- **Via `.env`:** Set `BW_APPLIANCES=00:22:a3:14:bf:6f` in `/opt/bwheater/.env` and run `./bwctl restart`.
 
 ### How do I change the polling interval (e.g. to every 30 minutes)?
 1. Edit `/opt/bwheater/.env` and set:

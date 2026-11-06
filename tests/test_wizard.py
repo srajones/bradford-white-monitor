@@ -161,7 +161,7 @@ class SettingsFile(unittest.TestCase):
         self.assertTrue(text.endswith("\n"))
         # the explanations survive, so the file stays self-documenting
         self.assertIn("# ----- 1. WHERE ALERTS GO", text)
-        self.assertIn("NO Wave PASSWORD GOES HERE", text)
+        self.assertIn("SIGN-IN OPTIONS:", text)
 
     def test_the_rendered_template_with_nothing_chosen_equals_the_shipped_defaults(self):
         parsed = read_compose_env(wizard.render_env(TEMPLATE, {}))
@@ -177,7 +177,7 @@ class SettingsFile(unittest.TestCase):
 
     def test_template_keys_cover_everything_the_code_reads(self):
         keys = set(wizard.template_keys(TEMPLATE))
-        for name in ("NTFY_TOPIC", "HA_WEBHOOK_URL", "BW_FAULT_REQUEST", "DISPLAY_TZ", "BW_POLL_INTERVAL_SECONDS", "HEARTBEAT_URL", "LOG_FILE"):
+        for name in ("NTFY_TOPIC", "HA_WEBHOOK_URL", "BW_FAULT_REQUEST", "BW_APPLIANCES", "DISPLAY_TZ", "BW_POLL_INTERVAL_SECONDS", "HEARTBEAT_URL", "LOG_FILE"):
             self.assertIn(name, keys)
         self.assertNotIn("DATA_DIR", keys, "fixed by docker-compose.yml")
 

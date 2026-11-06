@@ -2,6 +2,7 @@
 # bwctl: everyday helper for bwwatch. Run it from anywhere:  /opt/bwheater/bwctl <command>
 #
 #   status                  one-screen summary (service, last poll, heater settings, faults)
+#   heaters                 list water heaters and choose which one(s) to monitor
 #   poll                    trigger an immediate manual poll and record everything to database
 #   readings                recorded temperatures and operating settings over time
 #   faults [--all] [--raw]  the faults it has logged
@@ -47,7 +48,7 @@ running() {
 }
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   printf '\nAnything else is passed to bwwatch itself:  bwctl <command> --help\n'
 }
 
@@ -70,11 +71,21 @@ in_service() {
   fi
 }
 
-cmd=${1:-menu}
-[ $# -gt 0 ] && shift
+if [ $# -eq 0 ]; then
+  if [ -t 0 ] && [ -t 1 ] && [ -x "$DIR/bwcheat" ]; then
+    cmd=menu
+  else
+    cmd=help
+  fi
+else
+  cmd=$1
+  shift
+fi
 
 case $cmd in
-  menu|cheat)     exec "$DIR/bwcheat" "$@" ;;
+  menu|cheat)
+    if [ -x "$DIR/bwcheat" ]; then exec "$DIR/bwcheat" "$@"; else usage; fi
+    ;;
   help|-h|--help) usage ;;
   reconfigure)    exec "$DIR/install.sh" --reconfigure ;;
   uninstall)      exec "$DIR/install.sh" --uninstall ;;
@@ -86,6 +97,36 @@ case $cmd in
     need_ready
     printf 'Rebuilding the image from the files in %s ...\n' "$DIR"
     dc build && dc up -d bwwatch && printf 'Done. Checking:\n' && dc exec -T bwwatch bwwatch verify --wait 60
+    ;;
+  heaters)
+    need_ready
+    rm -f "$DIR/data/.bw_appliances.env" 2>/dev/null || true
+    in_service heaters "$@"
+    _rc=$?
+    if [ -f "$DIR/data/.bw_appliances.env" ]; then
+      _val=$(tr -d '\r\n' < "$DIR/data/.bw_appliances.env")
+      rm -f "$DIR/data/.bw_appliances.env"
+      if [ -f "$DIR/.env" ]; then
+        if grep -q '^[[:space:]]*#*[[:space:]]*BW_APPLIANCES=' "$DIR/.env"; then
+          awk -v val="$_val" '
+            /^[[:space:]]*#*[[:space:]]*BW_APPLIANCES=/ && !done {
+              if (val == "") print "# BW_APPLIANCES=";
+              else print "BW_APPLIANCES=" val;
+              done=1; next
+            }
+            { print }
+          ' "$DIR/.env" > "$DIR/.env.new" && mv "$DIR/.env.new" "$DIR/.env"
+        elif [ -n "$_val" ]; then
+          cp "$DIR/.env" "$DIR/.env.new" && printf '\nBW_APPLIANCES=%s\n' "$_val" >> "$DIR/.env.new" && mv "$DIR/.env.new" "$DIR/.env"
+        fi
+        chmod 600 "$DIR/.env" 2>/dev/null || true
+      fi
+      if running; then
+        printf 'Applying heater selection to running watcher...\n'
+        dc up -d --force-recreate bwwatch >/dev/null
+      fi
+    fi
+    exit $_rc
     ;;
   report)
     need_ready

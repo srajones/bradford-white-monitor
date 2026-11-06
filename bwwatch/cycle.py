@@ -110,19 +110,29 @@ def fetch(
     items = api.list_appliances()  # signs in first; AuthError / TransientError propagate
     if not items:
         result.errors.append("the account has no appliances")
-    prepared: List[ApplianceData] = []
+    all_prepared: List[ApplianceData] = []
     for item in items:
         mac = mac_of(item)
         if not mac:
             result.errors.append("an appliance in the list has no macAddress")
             continue
-        prepared.append(ApplianceData(
+        all_prepared.append(ApplianceData(
             mac=mac,
             name=str(item.get("friendlyName") or mac),
             serial=str(item.get("serialNumber") or ""),
             model=str(item.get("applianceType") or ""),
             listing=item,
         ))
+    selected = cfg.selected_appliances
+    if selected:
+        prepared = [a for a in all_prepared if cfg.matches_appliance(a.mac, a.name, a.serial)]
+        if all_prepared and not prepared:
+            result.errors.append(
+                "none of the %d appliance(s) on this account match BW_APPLIANCES (%s); run ./bwctl heaters to choose"
+                % (len(all_prepared), ", ".join(selected))
+            )
+    else:
+        prepared = all_prepared
     fault_spec = cfg.fault_request
     if fault_spec is None and resolve_fault is not None and prepared:
         try:

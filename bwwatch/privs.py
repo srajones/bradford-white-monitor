@@ -17,7 +17,7 @@ APP_GID = 10001
 # Only files bwwatch itself creates are ever re-owned - never arbitrary files in a mounted directory.
 _KNOWN_FILES = (
     "bwwatch.db", "bwwatch.db-wal", "bwwatch.db-shm", "bwwatch.db-journal",
-    "token.json", "status.json", "bwwatch.lock",
+    "token.json", "status.json", "bwwatch.lock", "heaters.json",
 )
 
 

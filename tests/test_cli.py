@@ -284,5 +284,111 @@ class Misc(CliCase):
         self.assertEqual(cli._csv_safe("plain"), "plain")
 
 
+class MultiHeaterSelection(CliCase):
+    """Accounts with multiple water heaters (e.g. an old replaced unit plus the active AeroThermSeries)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mock.appliances = [
+            {
+                "macAddress": "aa:bb:cc:dd:ee:01",
+                "friendlyName": "OldHeater",
+                "serialNumber": "OLD111",
+                "applianceType": "WH_OLD",
+            },
+            {
+                "macAddress": "00:22:a3:14:bf:6f",
+                "friendlyName": "AeroThermSeries",
+                "serialNumber": "NEW222",
+                "applianceType": "WH_HP",
+            },
+            {
+                "macAddress": "aa:bb:cc:dd:ee:03",
+                "friendlyName": "GuestHouse",
+                "serialNumber": "GST333",
+                "applianceType": "WH_HP",
+            },
+        ]
+        self.mock.status["aa:bb:cc:dd:ee:01"] = {"mode": "Heat Pump", "setpointFahrenheit": 110, "faultCode": 10}
+        self.mock.status["00:22:a3:14:bf:6f"] = {"mode": "Heat Pump", "setpointFahrenheit": 120, "faultCode": 0}
+        self.mock.status["aa:bb:cc:dd:ee:03"] = {"mode": "Hybrid", "setpointFahrenheit": 130, "faultCode": 0}
+
+    def test_select_single_heater_polls_and_shows_only_selected_heater(self):
+        # First poll with all 3 heaters so the database has records for all 3
+        svc = self.service(self.cfg())
+        self.assertTrue(svc.cycle().ok)
+
+        # Select only heater #2: AeroThermSeries (00:22:a3:14:bf:6f)
+        cfg = self.cfg()
+        code, out = self.run_cmd(cli.cmd_heaters, cfg, list_only=False, select="2")
+        self.assertEqual(code, 0, out)
+        self.assertIn("AeroThermSeries (00:22:a3:14:bf:6f)", out)
+        self.assertEqual(cfg.selected_appliances, ("00:22:a3:14:bf:6f",))
+        self.assertEqual((self.data / ".bw_appliances.env").read_text(encoding="utf-8").strip(), "00:22:a3:14:bf:6f")
+
+        # Status, readings, faults, fields, and report must only show AeroThermSeries and ignore OldHeater & GuestHouse
+        code, status_out = self.run_cmd(cli.cmd_status, cfg)
+        self.assertEqual(code, 0, status_out)
+        self.assertIn("AeroThermSeries (00:22:a3:14:bf:6f)", status_out)
+        self.assertNotIn("OldHeater", status_out)
+        self.assertNotIn("GuestHouse", status_out)
+        self.assertIn("2 other heaters on account ignored", status_out)
+
+        code, readings_out = self.run_cmd(cli.views.cmd_readings, cfg, limit=25, mac=None)
+        self.assertEqual(code, 0, readings_out)
+        self.assertIn("120.0°F", readings_out)
+        self.assertNotIn("110.0°F", readings_out)
+        self.assertNotIn("130.0°F", readings_out)
+
+        code, faults_out = self.run_cmd(cli.cmd_faults, cfg, limit=20, all=True, raw=False)
+        self.assertEqual(code, 0, faults_out)
+        self.assertIn("No faults logged yet.", faults_out)
+
+        code, rep_out = self.run_cmd(cli.cmd_report, cfg, out_dir=None)
+        self.assertEqual(code, 0, rep_out)
+        report_md = (self.data / "exports" / "report.md").read_text(encoding="utf-8")
+        self.assertIn("AeroThermSeries", report_md)
+        self.assertNotIn("OldHeater", report_md)
+        self.assertNotIn("GuestHouse", report_md)
+
+        # Polling now only queries getApplianceStatus for 00:22:a3:14:bf:6f
+        before_calls = len(self.mock.requests)
+        self.assertTrue(svc.cycle().ok)
+        new_requests = self.mock.requests[before_calls:]
+        status_calls = [r for r in new_requests if "/wave/getApplianceStatus" in r["path"]]
+        self.assertEqual(len(status_calls), 1)
+        self.assertEqual(status_calls[0]["query"].get("macAddress"), "00:22:a3:14:bf:6f")
+
+    def test_select_two_heaters_or_all(self):
+        cfg = self.cfg()
+        self.sign_in(cfg)
+        # Select 2 of the 3 heaters ("2,3")
+        code, out = self.run_cmd(cli.cmd_heaters, cfg, list_only=False, select="2,3")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg.selected_appliances, ("00:22:a3:14:bf:6f", "aa:bb:cc:dd:ee:03"))
+
+        svc = self.service(cfg)
+        self.assertTrue(svc.cycle().ok)
+
+        code, status_out = self.run_cmd(cli.cmd_status, cfg)
+        self.assertIn("AeroThermSeries", status_out)
+        self.assertIn("GuestHouse", status_out)
+        self.assertNotIn("OldHeater", status_out)
+
+        # Now select "all"
+        code, out = self.run_cmd(cli.cmd_heaters, cfg, list_only=False, select="all")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg.selected_appliances, ())
+        self.assertIn("monitoring ALL water heaters", out)
+
+    def test_unmatched_bw_appliances_filter_reports_clear_error(self):
+        cfg = self.cfg(BW_APPLIANCES="ff:ff:ff:ff:ff:ff")
+        svc = self.service(cfg)
+        outcome = svc.cycle()
+        self.assertFalse(outcome.ok)
+        self.assertIn("BW_APPLIANCES", outcome.error)
+        self.assertIn("./bwctl heaters", outcome.error)
+
+
 if __name__ == "__main__":
     unittest.main()

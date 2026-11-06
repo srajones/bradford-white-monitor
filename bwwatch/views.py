@@ -6,13 +6,15 @@ These commands only read the database. ``./bwctl fields`` is the answer to "what
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from .config import Config
+from .config import Config, monitored_macs
+from .cycle import ACCOUNT
 from .db import DB_NAME, connect, init_schema
 from .util import iso, local_time, parse_iso, truncate
 
@@ -70,13 +72,15 @@ def cmd_fields(cfg: Config, args: argparse.Namespace) -> int:
         print("No database yet - has the service run?")
         return 1
     try:
+        monitored = monitored_macs(conn, cfg)
         wanted = _pattern(args.match)
         rows = [
             r for r in conn.execute(
                 "SELECT s.*, a.name AS appliance FROM field_state s LEFT JOIN appliances a ON a.mac = s.mac "
                 "ORDER BY s.mac, s.source, s.path"
             )
-            if wanted is None or wanted.search("%s.%s" % (r["source"], r["path"]))
+            if (monitored is None or r["mac"] in monitored or r["mac"] == ACCOUNT)
+            and (wanted is None or wanted.search("%s.%s" % (r["source"], r["path"])))
         ]
         if not rows:
             print("No fields logged yet." if wanted is None else "No logged field matches %r." % args.match)
@@ -105,6 +109,7 @@ def cmd_changes(cfg: Config, args: argparse.Namespace) -> int:
         print("No database yet - has the service run?")
         return 1
     try:
+        monitored = monitored_macs(conn, cfg)
         wanted = _pattern(args.match)
         where: List[str] = []
         params: List[Any] = []
@@ -122,7 +127,8 @@ def cmd_changes(cfg: Config, args: argparse.Namespace) -> int:
             r for r in conn.execute(
                 "SELECT o.*, a.name AS appliance FROM observations o LEFT JOIN appliances a ON a.mac = o.mac "
                 + ("WHERE " + " AND ".join(where) if where else "") + " ORDER BY o.id", params)
-            if wanted is None or wanted.search("%s.%s" % (r["source"], r["path"]))
+            if (monitored is None or r["mac"] in monitored or r["mac"] == ACCOUNT)
+            and (wanted is None or wanted.search("%s.%s" % (r["source"], r["path"])))
         ]
         if not rows:
             print("Nothing changed in that time." if not args.all else "Nothing logged in that time.")
@@ -206,10 +212,14 @@ def cmd_energy(cfg: Config, args: argparse.Namespace) -> int:
             "SELECT e.*, a.name AS appliance FROM energy_usage e "
             "LEFT JOIN appliances a ON a.mac = e.mac "
             + ("WHERE " + " AND ".join(where) if where else "")
-            + " ORDER BY e.ts DESC LIMIT ?"
+            + " ORDER BY e.ts DESC"
         )
-        params.append(limit if limit > 0 else 500)
         rows = conn.execute(query, params).fetchall()
+        if not getattr(args, "mac", None):
+            monitored = monitored_macs(conn, cfg)
+            if monitored is not None:
+                rows = [r for r in rows if r["mac"] in monitored]
+        rows = rows[: limit if limit > 0 else 500]
         if not rows:
             print("No energy usage records found for view %r." % view)
             return 0
@@ -247,12 +257,24 @@ def cmd_readings(cfg: Config, args: argparse.Namespace) -> int:
         return 1
     try:
         limit = getattr(args, "limit", 25)
-        rows = conn.execute(
-            """SELECT r.*, a.name AS appliance FROM readings r
-               LEFT JOIN appliances a ON a.mac = r.mac
-               ORDER BY r.id DESC LIMIT ?""",
-            (limit if limit > 0 else 500,),
-        ).fetchall()
+        mac_arg = getattr(args, "mac", None)
+        if mac_arg:
+            rows = conn.execute(
+                """SELECT r.*, a.name AS appliance FROM readings r
+                   LEFT JOIN appliances a ON a.mac = r.mac
+                   WHERE r.mac = ? ORDER BY r.id DESC""",
+                (mac_arg,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT r.*, a.name AS appliance FROM readings r
+                   LEFT JOIN appliances a ON a.mac = r.mac
+                   ORDER BY r.id DESC"""
+            ).fetchall()
+            monitored = monitored_macs(conn, cfg)
+            if monitored is not None:
+                rows = [r for r in rows if r["mac"] in monitored]
+        rows = rows[: limit if limit > 0 else 500]
         if not rows:
             print("No status readings recorded yet.")
             return 0
@@ -304,4 +326,5 @@ def add_arguments(sub: Any) -> None:
     p.add_argument("--element-only", action="store_true", help="only show intervals where the backup element fired")
     p = sub.add_parser("readings", help="show recorded tank temperatures and operating settings over time")
     p.add_argument("--limit", type=int, default=25, help="how many entries to show (default 25; 0 = all)")
+    p.add_argument("--mac", help="filter by appliance mac address")
 

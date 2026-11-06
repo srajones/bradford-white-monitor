@@ -5,9 +5,10 @@ import csv
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Set
 
-from .config import Config
+from .config import Config, monitored_macs
+from .cycle import ACCOUNT
 from .db import DB_NAME, connect, init_schema
 from .util import iso, local_time, parse_iso, truncate
 
@@ -25,6 +26,7 @@ def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
     init_schema(conn)
 
     try:
+        monitored = monitored_macs(conn, cfg)
         # 1. Export CSVs
         _export_table(
             conn,
@@ -33,6 +35,8 @@ def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
                       f.mac, f.kind, f.code, f.description, f.occurred_at, f.state, f.cleared_seen_at,
                       f.seen_count, f.baseline, f.source
                FROM faults f LEFT JOIN appliances a ON a.mac = f.mac ORDER BY f.id DESC""",
+            monitored=monitored,
+            allow_account=True,
         )
 
         _export_table(
@@ -40,6 +44,7 @@ def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
             target_dir / "readings.csv",
             """SELECT r.taken_at, a.name AS appliance, r.mac, r.mode, r.mode_value, r.setpoint_f, r.temps
                FROM readings r LEFT JOIN appliances a ON a.mac = r.mac ORDER BY r.taken_at DESC""",
+            monitored=monitored,
         )
 
         _export_table(
@@ -48,10 +53,11 @@ def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
             """SELECT e.ts AS timestamp, a.name AS appliance, e.mac, e.view, e.total_energy,
                       e.heat_pump_energy, e.element_energy, e.reported_minutes
                FROM energy_usage e LEFT JOIN appliances a ON a.mac = e.mac ORDER BY e.ts DESC""",
+            monitored=monitored,
         )
 
         # 2. Build Markdown report
-        md_text = _build_markdown_report(conn, cfg)
+        md_text = _build_markdown_report(conn, cfg, monitored=monitored)
         report_path = target_dir / "report.md"
         report_path.write_text(md_text, encoding="utf-8")
         return target_dir
@@ -59,19 +65,31 @@ def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
         conn.close()
 
 
-def _export_table(conn: sqlite3.Connection, out_file: Path, query: str) -> int:
+def _export_table(
+    conn: sqlite3.Connection,
+    out_file: Path,
+    query: str,
+    monitored: Optional[Set[str]] = None,
+    allow_account: bool = False,
+) -> int:
     cursor = conn.execute(query)
     count = 0
     with open(out_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([d[0] for d in cursor.description])
         for row in cursor:
+            if monitored is not None:
+                mac = row["mac"]
+                if mac not in monitored and not (allow_account and mac == ACCOUNT):
+                    continue
             writer.writerow([v if v is not None else "" for v in tuple(row)])
             count += 1
     return count
 
 
-def _build_markdown_report(conn: sqlite3.Connection, cfg: Config) -> str:
+def _build_markdown_report(
+    conn: sqlite3.Connection, cfg: Config, monitored: Optional[Set[str]] = None
+) -> str:
     now_str = local_time(iso(), cfg.display_tz)
     lines: List[str] = [
         "# Bradford White Water Heater Report",
@@ -81,7 +99,10 @@ def _build_markdown_report(conn: sqlite3.Connection, cfg: Config) -> str:
     ]
 
     # Appliances & latest reading
-    appliances = conn.execute("SELECT * FROM appliances ORDER BY name").fetchall()
+    appliances = [
+        a for a in conn.execute("SELECT * FROM appliances ORDER BY name").fetchall()
+        if monitored is None or a["mac"] in monitored
+    ]
     if not appliances:
         lines.append("*No appliance records in database yet.*")
     else:
@@ -117,10 +138,13 @@ def _build_markdown_report(conn: sqlite3.Connection, cfg: Config) -> str:
 
     # Faults
     lines.append("## Fault History")
-    faults = conn.execute(
-        """SELECT f.*, a.name AS appliance_name FROM faults f
-           LEFT JOIN appliances a ON a.mac = f.mac ORDER BY f.id DESC"""
-    ).fetchall()
+    faults = [
+        f for f in conn.execute(
+            """SELECT f.*, a.name AS appliance_name FROM faults f
+               LEFT JOIN appliances a ON a.mac = f.mac ORDER BY f.id DESC"""
+        ).fetchall()
+        if monitored is None or f["mac"] in monitored or f["mac"] == ACCOUNT
+    ]
 
     if not faults:
         lines.append("No faults have been recorded.")
@@ -146,14 +170,17 @@ def _build_markdown_report(conn: sqlite3.Connection, cfg: Config) -> str:
 
     # Energy summary
     lines.append("## Energy Usage Summary")
-    energy_totals = conn.execute(
-        """SELECT SUM(total_energy) AS tot, SUM(heat_pump_energy) AS hp, SUM(element_energy) AS el
-           FROM energy_usage WHERE view = 'daily'"""
-    ).fetchone()
+    all_daily = [
+        r for r in conn.execute(
+            """SELECT mac, ts, total_energy, heat_pump_energy, element_energy, reported_minutes
+               FROM energy_usage WHERE view = 'daily' ORDER BY ts DESC"""
+        ).fetchall()
+        if monitored is None or r["mac"] in monitored
+    ]
 
-    tot = energy_totals["tot"] or 0.0
-    hp = energy_totals["hp"] or 0.0
-    el = energy_totals["el"] or 0.0
+    tot = sum((r["total_energy"] or 0.0) for r in all_daily)
+    hp = sum((r["heat_pump_energy"] or 0.0) for r in all_daily)
+    el = sum((r["element_energy"] or 0.0) for r in all_daily)
 
     lines.append(f"- **Total Energy Recorded**: {tot:.2f} kWh")
     if tot > 0:
@@ -164,10 +191,7 @@ def _build_markdown_report(conn: sqlite3.Connection, cfg: Config) -> str:
         lines.append(f"- **Backup Electric Element**: {el:.2f} kWh")
 
     # Recent daily energy table
-    daily_rows = conn.execute(
-        """SELECT ts, total_energy, heat_pump_energy, element_energy, reported_minutes
-           FROM energy_usage WHERE view = 'daily' ORDER BY ts DESC LIMIT 14"""
-    ).fetchall()
+    daily_rows = all_daily[:14]
 
     if daily_rows:
         lines.append("")

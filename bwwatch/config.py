@@ -6,13 +6,85 @@ import re
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple
 
 from .errors import ConfigError, ReadOnlyViolation
 from .readonly import check_read_only
-from .util import norm_key
+from .util import atomic_write_json, iso, norm_key
 
-__all__ = ["Config", "ConfigError", "FaultOptions", "RequestSpec", "load_env_file", "norm_key"]
+__all__ = [
+    "Config",
+    "ConfigError",
+    "FaultOptions",
+    "RequestSpec",
+    "load_env_file",
+    "load_selected_appliances",
+    "monitored_macs",
+    "norm_key",
+    "save_selected_appliances",
+]
+
+HEATERS_FILE = "heaters.json"
+
+
+def save_selected_appliances(data_dir: Path, selected: Sequence[str], env_val: str = "") -> None:
+    """Persist the user's water-heater selection inside the data directory."""
+    cleaned = [s.strip() for s in selected if isinstance(s, str) and s.strip() and s.strip().lower() not in ("all", "*")]
+    record = {
+        "selected": cleaned,
+        "env_bw_appliances": (env_val or "").strip(),
+        "updated_at": iso(),
+    }
+    atomic_write_json(Path(data_dir) / HEATERS_FILE, record, mode=0o600)
+
+
+def load_selected_appliances(data_dir: Path, env_appliances: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+    """Return the active heater filter (empty tuple = monitor all heaters).
+
+    Reads ``heaters.json`` in ``data_dir`` if present, unless ``BW_APPLIANCES`` in ``.env``
+    was manually changed after ``heaters.json`` was written.
+    """
+    path = Path(data_dir) / HEATERS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return env_appliances
+    if not isinstance(data, dict) or not isinstance(data.get("selected"), list):
+        return env_appliances
+    saved_env_raw = str(data.get("env_bw_appliances") or "").strip()
+    saved_env = tuple(part.strip() for part in saved_env_raw.split(",") if part.strip())
+    if len(saved_env) == 1 and saved_env[0].lower() in ("all", "*"):
+        saved_env = ()
+    if env_appliances != saved_env and env_appliances:
+        return env_appliances
+    return tuple(
+        s.strip()
+        for s in data["selected"]
+        if isinstance(s, str) and s.strip() and s.strip().lower() not in ("all", "*")
+    )
+
+
+def monitored_macs(conn: Any, cfg: "Config") -> Optional[FrozenSet[str]]:
+    """Return the set of monitored appliance MACs, or None when all heaters are monitored."""
+    selected = cfg.selected_appliances
+    if not selected:
+        return None
+    matched = set()
+    try:
+        rows = conn.execute("SELECT mac, name, serial FROM appliances").fetchall()
+        for row in rows:
+            mac = row["mac"] or ""
+            name = row["name"] or ""
+            serial = row["serial"] or ""
+            if mac and cfg.matches_appliance(mac, name, serial):
+                matched.add(mac)
+    except Exception:  # noqa: BLE001
+        pass
+    for token in selected:
+        t = token.strip()
+        if t and cfg.matches_appliance(t):
+            matched.add(t)
+    return frozenset(matched)
 
 
 def load_env_file(path: Path | str = ".env") -> Dict[str, str]:
@@ -266,6 +338,31 @@ class Config:
     # While a Notifications entry is active, poll this often, but only for fault_poll_hours after it was first seen.
     fault_poll_interval: int = 600
     fault_poll_hours: int = 12
+    # Optional filter of water heaters to monitor (MACs, serials, or friendly names; empty = monitor all).
+    appliances: Tuple[str, ...] = ()
+
+    @property
+    def selected_appliances(self) -> Tuple[str, ...]:
+        """Active water heater filter (combines live heaters.json selection and BW_APPLIANCES)."""
+        return load_selected_appliances(self.data_dir, self.appliances)
+
+    def matches_appliance(self, mac: str, name: str = "", serial: str = "") -> bool:
+        """True if this heater is selected for monitoring (or when all heaters are monitored)."""
+        selected = self.selected_appliances
+        if not selected:
+            return True
+        candidates = {s.strip().lower() for s in (mac, name, serial) if s and s.strip()}
+        norm_candidates = {norm_key(s) for s in (mac, name, serial) if s and s.strip()}
+        for token in selected:
+            t = token.strip().lower()
+            if not t or t in ("all", "*"):
+                return True
+            if t in candidates:
+                return True
+            tn = norm_key(t)
+            if tn and tn in norm_candidates:
+                return True
+        return False
 
     @property
     def token_url(self) -> str:
@@ -505,7 +602,11 @@ def _build(env: Mapping[str, str]) -> Config:
         raise ConfigError("HEARTBEAT_URL must start with https:// or http://")
 
     display_tz = _get(env, "DISPLAY_TZ", "UTC") or "UTC"
-
+    raw_appliances = _csv(_get(env, "BW_APPLIANCES"))
+    if len(raw_appliances) == 1 and raw_appliances[0].lower() in ("all", "*"):
+        appliances: Tuple[str, ...] = ()
+    else:
+        appliances = raw_appliances
 
     default_data_dir = "data" if Path("data").is_dir() else "/data"
     return Config(
@@ -553,4 +654,5 @@ def _build(env: Mapping[str, str]) -> Config:
         keep_days=_int(env, "BW_KEEP_HISTORY_DAYS", 365, 0, 3650),
         fault_poll_interval=_int(env, "BW_FAULT_POLL_INTERVAL_SECONDS", 600, MIN_POLL_SECONDS, 86400),
         fault_poll_hours=_int(env, "BW_FAULT_POLL_HOURS", 12, 1, 24 * 14),
+        appliances=appliances,
     )

@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from . import __version__, discover, observe
-from .config import MIN_POLL_SECONDS, Config
-from .cycle import FetchResult, Outcome, apply_cycle, deliver_outbox, enqueue, fetch
+from .config import MIN_POLL_SECONDS, Config, monitored_macs
+from .cycle import ACCOUNT, FetchResult, Outcome, apply_cycle, deliver_outbox, enqueue, fetch
 from .db import (
     Recovery,
     backup_now,
@@ -109,15 +109,18 @@ class Service:
             return None
         try:
             rows = self.conn.execute(
-                "SELECT first_seen_at FROM faults WHERE kind = 'event' AND state = 'active'"
+                "SELECT mac, first_seen_at FROM faults WHERE kind = 'event' AND state = 'active'"
             ).fetchall()
         except sqlite3.Error:
             return None
+        monitored = monitored_macs(self.conn, self.cfg)
         window = self.cfg.fault_poll_hours * 3600
         now = time.time()
         for row in rows:
+            if monitored is not None and row["mac"] != ACCOUNT and row["mac"] not in monitored:
+                continue
             try:
-                age = now - parse_iso(row[0]).timestamp()
+                age = now - parse_iso(row["first_seen_at"]).timestamp()
             except ValueError:
                 continue
             if 0 <= age <= window:

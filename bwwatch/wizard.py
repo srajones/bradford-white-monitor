@@ -37,6 +37,7 @@ SETTING_GROUPS = (
     ("the check interval", ("BW_POLL_INTERVAL_SECONDS",)),
     ("the time zone", ("DISPLAY_TZ",)),
     ("the Notifications request", ("BW_FAULT_REQUEST",)),
+    ("the monitored appliances", ("BW_APPLIANCES",)),
     ("the dead-man's-switch address", ("HEARTBEAT_URL",)),
     ("the ntfy settings", ("NTFY_",)),
     ("the Telegram settings", ("TELEGRAM_",)),

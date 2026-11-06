@@ -65,6 +65,8 @@ def _snapshot(cfg: Config, since: Optional[float] = None) -> Dict[str, Any]:
             ).fetchone()
         snap["heaters"] = []
         for row in conn.execute("SELECT * FROM appliances ORDER BY name"):
+            if not cfg.matches_appliance(row["mac"], row["name"] or "", row["serial"] or ""):
+                continue
             reading = conn.execute("SELECT * FROM readings WHERE mac = ? ORDER BY id DESC LIMIT 1", (row["mac"],)).fetchone()
             snap["heaters"].append((row["name"] or row["mac"], reading_from_row(reading).summary() if reading else None))
         counts = {r[0]: r[1] for r in conn.execute("SELECT status, COUNT(*) FROM outbox GROUP BY status")}
