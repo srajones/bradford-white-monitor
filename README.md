@@ -20,7 +20,9 @@ The official Bradford White Wave Android and iOS apps **do not send push notific
 - 🔔 **Instant Alerts:** Pushes alerts straight to your phone the moment a fault is logged.
 - ⚡ **Energy & Temperature Monitoring:** Tracks heat pump compressor vs electric element kWh and setpoints over time.
 - ⏱️ **Fault History & Cleared Faults:** Catches transient faults that appear and clear on their own between checks.
-- 🎮 **Zero Memory CLI Menu (`bwcheat` / `bwctl`):** An interactive numbered menu (options 0–13) so you never need to remember complex Docker commands.
+- 🎮 **Zero Memory CLI Menu (`bwcheat` / `bwctl`):** An interactive numbered menu (options 0–14) so you never need to remember complex Docker commands.
+- 🔄 **One-Step Auto-Updater (`bwupdate`):** Automatically finds the latest branch, pulls new commits, rebuilds the container, and verifies health in one command.
+- 🏠 **Multi-Heater Selection (`./bwctl heaters`):** Choose 1, 2, 3, or `all` water heaters on your Wave account so old/offline heaters are completely ignored.
 - 📊 **One-Click Reports & CSV Exports:** Exports `report.md`, `faults.csv`, `readings.csv`, and `energy.csv` for plumbers or warranty claims.
 - ☁️ **Optional Cloud Backup:** Guided hand-held script (`setup-rclone.sh`) to mirror backups to Dropbox with `rclone` (100% optional).
 - 🪶 **Lightweight — No Browser:** Plain Python talking directly to the API: no headless browser, no Selenium/Playwright, ~20–35 MB RAM, and zero open ports.
@@ -58,7 +60,7 @@ Run these commands on your server:
 ```bash
 # Create directory and clone the repository
 sudo mkdir -p /opt/bwheater && sudo chown -R "$USER" /opt/bwheater
-git clone https://github.com/srajones/bwwhitefaultcode.git /opt/bwheater
+git clone https://github.com/srajones/bradford-white-monitor.git /opt/bwheater
 cd /opt/bwheater
 
 # Run the guided installer
