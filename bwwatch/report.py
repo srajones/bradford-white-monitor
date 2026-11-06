@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 import sqlite3
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any, List, Optional, Set
 from .config import Config, monitored_macs
 from .cycle import ACCOUNT
 from .db import DB_NAME, connect, init_schema
-from .util import iso, local_time, parse_iso, truncate
+from .util import csv_safe, iso, local_time, parse_iso, truncate
 
 
 def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
@@ -65,6 +66,14 @@ def generate_report(cfg: Config, out_dir: Optional[Path] = None) -> Path:
         conn.close()
 
 
+def _clean_cell(val: Any, max_len: int = 50) -> str:
+    if val is None:
+        return "-"
+    s = truncate(str(val), max_len)
+    s = html.escape(s)
+    return s.replace("|", "\\|").replace("\n", " ").replace("\r", "")
+
+
 def _export_table(
     conn: sqlite3.Connection,
     out_file: Path,
@@ -82,7 +91,7 @@ def _export_table(
                 mac = row["mac"]
                 if mac not in monitored and not (allow_account and mac == ACCOUNT):
                     continue
-            writer.writerow([v if v is not None else "" for v in tuple(row)])
+            writer.writerow([csv_safe(v) if v is not None else "" for v in tuple(row)])
             count += 1
     return count
 
@@ -103,6 +112,9 @@ def _build_markdown_report(
         a for a in conn.execute("SELECT * FROM appliances ORDER BY name").fetchall()
         if monitored is None or a["mac"] in monitored
     ]
+    is_multi = len(appliances) > 1
+    app_by_mac = {a["mac"]: (a["name"] or a["mac"]) for a in appliances}
+
     if not appliances:
         lines.append("*No appliance records in database yet.*")
     else:
@@ -149,15 +161,20 @@ def _build_markdown_report(
     if not faults:
         lines.append("No faults have been recorded.")
     else:
-        lines.append("| ID | Code | Description | State | Reported | Cleared | Duration |")
-        lines.append("|---|---|---|---|---|---|---|")
+        if is_multi:
+            lines.append("| ID | Appliance | Code | Description | State | Reported | Cleared | Duration |")
+            lines.append("|---|---|---|---|---|---|---|---|")
+        else:
+            lines.append("| ID | Code | Description | State | Reported | Cleared | Duration |")
+            lines.append("|---|---|---|---|---|---|---|")
         for f in faults:
             fid = f["id"]
-            code = f["code"] or "-"
-            desc = truncate(f["description"] or "No description", 50).replace("|", "\\|")
-            state = f["state"] or "unknown"
-            rep = local_time(f["occurred_at"] or f["first_seen_at"], cfg.display_tz)
-            clr = local_time(f["cleared_at"], cfg.display_tz) if f["cleared_at"] else "-"
+            app_name = _clean_cell(f["appliance_name"] or ("Account" if f["mac"] == ACCOUNT else f["mac"]), 30)
+            code = _clean_cell(f["code"], 20)
+            desc = _clean_cell(f["description"] or "No description", 50)
+            state = _clean_cell(f["state"] or "unknown", 20)
+            rep = _clean_cell(local_time(f["occurred_at"] or f["first_seen_at"], cfg.display_tz), 30)
+            clr = _clean_cell(local_time(f["cleared_at"], cfg.display_tz) if f["cleared_at"] else "-", 30)
             dur = "-"
             if f["occurred_at"] and f["cleared_at"]:
                 try:
@@ -165,7 +182,11 @@ def _build_markdown_report(
                     dur = f"{int(s // 60)} mins" if s >= 60 else f"{int(s)}s"
                 except Exception:
                     pass
-            lines.append(f"| {fid} | {code} | {desc} | {state} | {rep} | {clr} | {dur} |")
+            dur = _clean_cell(dur, 20)
+            if is_multi:
+                lines.append(f"| {fid} | {app_name} | {code} | {desc} | {state} | {rep} | {clr} | {dur} |")
+            else:
+                lines.append(f"| {fid} | {code} | {desc} | {state} | {rep} | {clr} | {dur} |")
     lines.append("")
 
     # Energy summary
@@ -196,15 +217,24 @@ def _build_markdown_report(
     if daily_rows:
         lines.append("")
         lines.append("### Recent Daily Breakdown (Last 14 Days)")
-        lines.append("| Date | Total (kWh) | Heat Pump (kWh) | Backup Element (kWh) | Run Time |")
-        lines.append("|---|---|---|---|---|")
+        if is_multi:
+            lines.append("| Date | Appliance | Total (kWh) | Heat Pump (kWh) | Backup Element (kWh) | Run Time |")
+            lines.append("|---|---|---|---|---|---|")
+        else:
+            lines.append("| Date | Total (kWh) | Heat Pump (kWh) | Backup Element (kWh) | Run Time |")
+            lines.append("|---|---|---|---|---|")
         for r in daily_rows:
-            d_date = local_time(r["ts"], cfg.display_tz).split()[0]
+            d_date = _clean_cell(local_time(r["ts"], cfg.display_tz).split()[0], 20)
+            app_name = _clean_cell(app_by_mac.get(r["mac"], r["mac"]), 30)
             d_tot = f"{r['total_energy']:.3f}" if r["total_energy"] is not None else "-"
             d_hp = f"{r['heat_pump_energy']:.3f}" if r["heat_pump_energy"] is not None else "-"
             d_el = f"{r['element_energy']:.3f}" if r["element_energy"] is not None else "-"
             d_mins = f"{r['reported_minutes']} mins" if r["reported_minutes"] is not None else "-"
-            lines.append(f"| {d_date} | {d_tot} | {d_hp} | {d_el} | {d_mins} |")
+            if is_multi:
+                lines.append(f"| {d_date} | {app_name} | {d_tot} | {d_hp} | {d_el} | {d_mins} |")
+            else:
+                lines.append(f"| {d_date} | {d_tot} | {d_hp} | {d_el} | {d_mins} |")
+
 
     lines.append("")
     lines.append("## Exported CSV Files")

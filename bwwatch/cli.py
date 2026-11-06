@@ -91,19 +91,24 @@ def add_file_logging(path: Path) -> None:
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
     cells = [[str(c) if c is not None else "" for c in row] for row in rows]
-    widths = [max(len(h), *(len(r[i]) for r in cells)) if cells else len(h) for i, h in enumerate(headers)]
+    widths = [max(len(h), *(len(r[i]) if i < len(r) else 0 for r in cells)) if cells else len(h) for i, h in enumerate(headers)]
     lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths)).rstrip()]
     lines.append("  ".join("-" * w for w in widths))
-    lines.extend("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in cells)
+    lines.extend("  ".join((r[i] if i < len(r) else "").ljust(w) for i, w in enumerate(widths)).rstrip() for r in cells)
     return "\n".join(lines)
 
 
 def _open_existing_db(cfg: Config) -> Optional[sqlite3.Connection]:
     if not (cfg.data_dir / DB_NAME).exists():
         return None
-    conn = connect(cfg.data_dir / DB_NAME)
-    init_schema(conn)
-    return conn
+    try:
+        conn = connect(cfg.data_dir / DB_NAME)
+        init_schema(conn)
+        return conn
+    except sqlite3.DatabaseError as exc:
+        print("error: database %s is damaged or corrupt: %s" % (cfg.data_dir / DB_NAME, exc), file=sys.stderr)
+        print("hint: run './bwctl backup' to list backups or restore from %s/backups" % cfg.data_dir, file=sys.stderr)
+        return None
 
 
 def _make_api(cfg: Config, stop: Optional[threading.Event] = None):
@@ -112,13 +117,19 @@ def _make_api(cfg: Config, stop: Optional[threading.Event] = None):
     return store, tokens, WaveApi(cfg, tokens, stop=stop)
 
 
-def _csv_safe(value: Any) -> Any:
-    """Stop spreadsheet programs treating text that starts with = + @ - as a formula."""
+def csv_safe(value: Any) -> Any:
+    """Stop spreadsheet programs treating text that starts with = + @ - | % as a formula."""
     if not isinstance(value, str):
         return value
-    if value[:1] in ("=", "+", "@") or re.match(r"-[^\d.]", value):
+    stripped = value.lstrip(" \t\r\n")
+    if stripped[:1] in ("=", "+", "@", "|", "%"):
+        return "'" + value
+    if stripped.startswith("-") and not re.match(r"^-\d+(\.\d+)?$", stripped):
         return "'" + value
     return value
+
+
+_csv_safe = csv_safe
 
 
 # --- run --------------------------------------------------------------------
@@ -332,8 +343,9 @@ def _resolve_ctx(api: WaveApi, spec: RequestSpec, mac: Optional[str], cfg: Optio
                 str(it.get("serialNumber") or it.get("serial") or ""),
             )
         ]
-        if matched:
-            first = matched
+        if not matched:
+            raise WaveError("none of the appliances on this account match BW_APPLIANCES")
+        first = matched
     item = first[0]
     ctx = {
         "mac": str(item.get("macAddress") or ""),
@@ -703,7 +715,10 @@ def _resolve_heater_choice(raw: str, heaters: list[dict[str, str]]) -> tuple[Opt
     text = raw.strip()
     if text.lower() in ("all", "a", "*"):
         return [], None
-    tokens = [t.strip() for t in re.split(r"[,;]+|\s+", text) if t.strip() and "," in text or ";" in text]
+    if "," in text or ";" in text:
+        tokens = [t.strip() for t in re.split(r"[,;]+", text) if t.strip()]
+    else:
+        tokens = [t.strip() for t in text.split() if t.strip()]
     if not tokens:
         tokens = [t.strip() for t in re.split(r"[,;\s]+", text) if t.strip()]
     # If the user typed a multi-word friendly name without commas (and not all digits), try matching the full string first
@@ -845,6 +860,9 @@ def cmd_discover(cfg: Config, args: argparse.Namespace) -> int:
                     str(it.get("serialNumber") or it.get("serial") or ""),
                 )
             ]
+            if cfg.selected_appliances and not matched:
+                print("error: none of the %d appliance(s) on this account match BW_APPLIANCES (%s)" % (len(items), ", ".join(cfg.selected_appliances)), file=sys.stderr)
+                return 1
             item = (matched or items)[0]
             appliance = type("Heater", (), {
                 "mac": str(item.get("macAddress") or ""),

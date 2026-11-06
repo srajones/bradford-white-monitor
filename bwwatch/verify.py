@@ -47,7 +47,11 @@ def _snapshot(cfg: Config, since: Optional[float] = None) -> Dict[str, Any]:
     path = cfg.data_dir / DB_NAME
     if not path.exists():
         return snap
-    conn = connect(path)
+    try:
+        conn = connect(path)
+    except sqlite3.DatabaseError as exc:
+        snap["db_error"] = str(exc)
+        return snap
     try:
         init_schema(conn)
         snap["db"] = True
@@ -75,6 +79,8 @@ def _snapshot(cfg: Config, since: Optional[float] = None) -> Dict[str, Any]:
             "SELECT last_error FROM outbox WHERE last_error IS NOT NULL ORDER BY id DESC LIMIT 1"
         ).fetchone()
         snap["backups"] = len(list_backups(cfg.data_dir / "backups"))
+    except sqlite3.DatabaseError as exc:
+        snap["db_error"] = str(exc)
     finally:
         conn.close()
     return snap
@@ -180,12 +186,15 @@ def _evaluate(cfg: Config, snap: Dict[str, Any], since: Optional[float] = None, 
 
     outbox = snap.get("outbox") or {}
     sent, pending, dropped = outbox.get("sent", 0), outbox.get("pending", 0), outbox.get("dropped", 0)
-    if sent:
-        checks.append(Check(OK, "Alerts delivered", "%d delivered so far" % sent))
-    elif pending:
+    if pending:
         err = snap.get("last_outbox_error")
-        checks.append(Check(WARN, "Alerts delivered", "%d waiting - last error: %s" % (pending, truncate(err[0] if err else "?", 160)),
-                            "Test your channels:  ./bwctl test-notify"))
+        detail = "%d delivered so far, %d waiting" % (sent, pending) if sent else "%d waiting" % pending
+        if err:
+            err_str = str(err[0]) if hasattr(err, "__getitem__") else str(err)
+            detail += " - last error: %s" % truncate(err_str, 160)
+        checks.append(Check(WARN, "Alerts delivered", detail, "Test your channels:  ./bwctl test-notify"))
+    elif sent:
+        checks.append(Check(OK, "Alerts delivered", "%d delivered so far" % sent))
     elif dropped:
         checks.append(Check(WARN, "Alerts delivered", "%d alert(s) were dropped (no channel wanted them)" % dropped, "Check your channel settings"))
     else:
@@ -210,7 +219,9 @@ def _evaluate(cfg: Config, snap: Dict[str, Any], since: Optional[float] = None, 
                             "BW_FAULT_REQUEST is not set; bwwatch tries GET /wave/getApplianceErrors on its own",
                             "See README, 'Finding the fault request'"))
 
-    if not snap.get("db"):
+    if snap.get("db_error"):
+        checks.append(Check(FAIL, "Database", "database error: %s" % snap["db_error"]))
+    elif not snap.get("db"):
         checks.append(Check(FAIL, "Database", "not created yet"))
     elif snap.get("integrity"):
         checks.append(Check(FAIL, "Database", "integrity check reported problems: %s" % "; ".join(snap["integrity"][:2])))

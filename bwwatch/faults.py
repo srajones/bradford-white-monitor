@@ -264,20 +264,23 @@ def normalize_event(item: Any, opts: FaultOptions) -> FaultEvent:
     if not isinstance(item, dict):
         text = truncate(str(item), 300)
         code = None
-        if isinstance(item, int):
+        if type(item) is int and item != 0:
             code = str(item)
         elif isinstance(item, str):
             found = FAULT_NUMBER.search(item)
             if found:
                 code = found.group(1)
-            elif item.strip().isdigit():
+            elif item.strip().isdigit() and int(item.strip()) != 0:
                 code = item.strip()
         return FaultEvent("h:" + digest(item)[:32], code, text, None, json.dumps(item, default=str, ensure_ascii=False))
     flat = _flatten(item)
     raw_json = json.dumps(item, default=str, ensure_ascii=False, sort_keys=True)
 
     code_value = flat.get(norm_key(opts.code_field)) if opts.code_field else _first(flat, CODE_KEYS)
-    code = str(code_value) if code_value not in (None, "") else None
+    if code_value is False or code_value == 0 or str(code_value).strip().lower() in ("false", "0", "none", "null", "no error", "normal", "ok", "clear"):
+        code = None
+    else:
+        code = str(code_value) if code_value not in (None, "") else None
 
     if opts.text_field:
         texts = [flat.get(norm_key(opts.text_field))]

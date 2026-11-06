@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -247,14 +248,18 @@ def tx(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 @contextmanager
 def savepoint(conn: sqlite3.Connection, name: str = "sp") -> Iterator[None]:
     """Nested all-or-nothing section inside :func:`tx`."""
-    conn.execute("SAVEPOINT %s" % name)
+    clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    conn.execute(f'SAVEPOINT "{clean_name}"')
     try:
         yield
     except BaseException:
-        conn.execute("ROLLBACK TO %s" % name)
-        conn.execute("RELEASE %s" % name)
+        try:
+            conn.execute(f'ROLLBACK TO "{clean_name}"')
+            conn.execute(f'RELEASE "{clean_name}"')
+        except Exception:
+            pass  # do not mask the original exception
         raise
-    conn.execute("RELEASE %s" % name)
+    conn.execute(f'RELEASE "{clean_name}"')
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -337,14 +342,23 @@ def _fsync_file(path: Path) -> None:
 def backup_now(conn: sqlite3.Connection, backups_dir: Path, keep: int) -> Path:
     """Write a verified, self-contained copy of the live database and prune old ones."""
     backups_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(str(backups_dir), 0o700)
+    except OSError:
+        pass
     for stale in backups_dir.glob(".bwwatch-*.tmp*"):  # left by a backup that was killed part-way
         try:
             if time.time() - stale.stat().st_mtime > 600:
                 stale.unlink()
         except OSError:
             pass
+    keep = max(1, keep)
     stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
     final = backups_dir / ("bwwatch-%s.db" % stamp)
+    counter = 1
+    while final.exists():
+        final = backups_dir / ("bwwatch-%s_%02d.db" % (stamp, counter))
+        counter += 1
     tmp = backups_dir / (".%s.tmp" % final.name)
     if tmp.exists():
         tmp.unlink()
@@ -365,7 +379,15 @@ def backup_now(conn: sqlite3.Connection, backups_dir: Path, keep: int) -> Path:
         raise
     target.close()
     _fsync_file(tmp)
+    try:
+        os.chmod(str(tmp), 0o600)
+    except OSError:
+        pass
     os.replace(str(tmp), str(final))
+    try:
+        os.chmod(str(final), 0o600)
+    except OSError:
+        pass
     fsync_dir(backups_dir)
     for old in list_backups(backups_dir)[keep:]:
         try:

@@ -21,7 +21,7 @@ from .util import iso, local_time, parse_iso, truncate
 
 def table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
     cells = [[str(c) if c is not None else "" for c in row] for row in rows]
-    widths = [max(len(h), *(len(r[i]) for r in cells)) if cells else len(h) for i, h in enumerate(headers)]
+    widths = [max(len(h), *(len(r[i]) for r in cells if i < len(r))) if cells else len(h) for i, h in enumerate(headers)]
     lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths)).rstrip(), "  ".join("-" * w for w in widths)]
     lines.extend("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in cells)
     return "\n".join(lines)
@@ -30,9 +30,12 @@ def table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
 def open_db(cfg: Config) -> Optional[sqlite3.Connection]:
     if not (cfg.data_dir / DB_NAME).exists():
         return None
-    conn = connect(cfg.data_dir / DB_NAME)
-    init_schema(conn)
-    return conn
+    try:
+        conn = connect(cfg.data_dir / DB_NAME)
+        init_schema(conn)
+        return conn
+    except sqlite3.DatabaseError:
+        return None
 
 
 def parse_when(text: str, tz_name: str = "UTC") -> str:
@@ -203,7 +206,7 @@ def cmd_energy(cfg: Config, args: argparse.Namespace) -> int:
         where = ["e.view = ?"]
         params: List[Any] = [view]
         if getattr(args, "mac", None):
-            where.append("e.mac = ?")
+            where.append("lower(e.mac) = lower(?)")
             params.append(args.mac)
         if getattr(args, "element_only", False):
             where.append("e.element_energy > 0")
@@ -219,7 +222,7 @@ def cmd_energy(cfg: Config, args: argparse.Namespace) -> int:
             monitored = monitored_macs(conn, cfg)
             if monitored is not None:
                 rows = [r for r in rows if r["mac"] in monitored]
-        rows = rows[: limit if limit > 0 else 500]
+        rows = rows[:limit] if (limit is not None and limit > 0) else rows
         if not rows:
             print("No energy usage records found for view %r." % view)
             return 0
@@ -262,7 +265,7 @@ def cmd_readings(cfg: Config, args: argparse.Namespace) -> int:
             rows = conn.execute(
                 """SELECT r.*, a.name AS appliance FROM readings r
                    LEFT JOIN appliances a ON a.mac = r.mac
-                   WHERE r.mac = ? ORDER BY r.id DESC""",
+                   WHERE lower(r.mac) = lower(?) ORDER BY r.id DESC""",
                 (mac_arg,),
             ).fetchall()
         else:
@@ -274,7 +277,7 @@ def cmd_readings(cfg: Config, args: argparse.Namespace) -> int:
             monitored = monitored_macs(conn, cfg)
             if monitored is not None:
                 rows = [r for r in rows if r["mac"] in monitored]
-        rows = rows[: limit if limit > 0 else 500]
+        rows = rows[:limit] if (limit is not None and limit > 0) else rows
         if not rows:
             print("No status readings recorded yet.")
             return 0

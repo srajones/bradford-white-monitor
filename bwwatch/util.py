@@ -101,13 +101,26 @@ def local_time(stamp: Optional[str], tz_name: str = "UTC") -> str:
 # token-looking material is removed before it gets there.
 _SECRET_PATTERNS = [
     (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [redacted]"),
+    (re.compile(r"(?i)basic\s+[A-Za-z0-9+/=]+"), "Basic [redacted]"),
+    (re.compile(r"://([^:\s/@]+):([^@\s/]+)@"), r"://\1:[redacted]@"),
     (re.compile(r"eyJ[\w-]{8,}(?:\.[\w-]*){2,}"), "[redacted-token]"),
     (
         re.compile(
-            r"(?i)\b(refresh_token|access_token|id_token|code|password|client_secret|token)"
-            r"(=|\"\s*:\s*\")[^&\s\"']+"
+            r'(?i)(["\']?(?:[a-z0-9_]*_)?(?:refresh_token|access_token|id_token|code|password|client_secret|token)["\']?\s*[:=]\s*)"(?:[^"\\\r\n]|\\.)*"'
         ),
-        r"\1\2[redacted]",
+        r'\1"[redacted]"',
+    ),
+    (
+        re.compile(
+            r"""(?i)(["']?(?:[a-z0-9_]*_)?(?:refresh_token|access_token|id_token|code|password|client_secret|token)["']?\s*[:=]\s*)'(?:[^'\\\r\n]|\\.)*'"""
+        ),
+        r"\1'[redacted]'",
+    ),
+    (
+        re.compile(
+            r'(?i)(["\']?(?:[a-z0-9_]*_)?(?:refresh_token|access_token|id_token|code|password|client_secret|token)["\']?\s*[:=]\s*)([^&\s"\',}]+)'
+        ),
+        r"\1[redacted]",
     ),
     (re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot[redacted]"),
 ]
@@ -167,3 +180,15 @@ def jwt_claims(token: str) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001 - any malformed token just means "no claims"
         return {}
+
+
+def csv_safe(value: Any) -> Any:
+    """Stop spreadsheet programs treating text that starts with = + @ - | % as a formula."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.lstrip(" \t\r\n")
+    if stripped[:1] in ("=", "+", "@", "|", "%"):
+        return "'" + value
+    if stripped.startswith("-") and not re.match(r"^-\d+(\.\d+)?$", stripped):
+        return "'" + value
+    return value

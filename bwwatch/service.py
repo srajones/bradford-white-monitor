@@ -25,6 +25,7 @@ from .db import (
     tx,
 )
 from .errors import AuthError, WaveError
+from .faults import _first, _flatten
 from .notify import Message, Notifier
 from .privs import acquire_lock
 from .util import atomic_write_json, hours_since, iso, parse_iso, scrub
@@ -109,7 +110,7 @@ class Service:
             return None
         try:
             rows = self.conn.execute(
-                "SELECT mac, first_seen_at FROM faults WHERE kind = 'event' AND state = 'active'"
+                "SELECT mac, first_seen_at, raw FROM faults WHERE kind = 'event' AND state = 'active'"
             ).fetchall()
         except sqlite3.Error:
             return None
@@ -117,8 +118,31 @@ class Service:
         window = self.cfg.fault_poll_hours * 3600
         now = time.time()
         for row in rows:
-            if monitored is not None and row["mac"] != ACCOUNT and row["mac"] not in monitored:
-                continue
+            if monitored is not None:
+                if row["mac"] != ACCOUNT:
+                    if row["mac"] not in monitored:
+                        continue
+                else:
+                    if self.cfg.selected_appliances and row["raw"]:
+                        try:
+                            item_data = json.loads(row["raw"])
+                            if isinstance(item_data, dict):
+                                flat_ev = _flatten(item_data)
+                                device_keys = (
+                                    "deviceid", "applianceid", "heaterid",
+                                    "serialnumber", "serial", "applianceserial",
+                                    "macaddress", "mac", "appliancemac",
+                                    "name", "appliancename", "appliance_name",
+                                )
+                                extracted_ids = [
+                                    str(flat_ev[k]).strip()
+                                    for k in device_keys
+                                    if flat_ev.get(k) is not None and str(flat_ev[k]).strip()
+                                ]
+                                if extracted_ids and not any(self.cfg.matches_appliance(ident) for ident in extracted_ids):
+                                    continue
+                        except Exception:
+                            pass
             try:
                 age = now - parse_iso(row["first_seen_at"]).timestamp()
             except ValueError:
@@ -447,6 +471,7 @@ class Service:
             self.next_poll_epoch = time.time() + hold
             self.write_status()
             retry_at: Optional[float] = None
+            retry_failures: int = 0
             while not self.stop.is_set():
                 now = time.monotonic()
                 if now >= next_poll:
@@ -458,14 +483,26 @@ class Service:
                         log.warning("next poll in %d s (stretched because of recent failures or a rate-limit request)", delay)
                     next_poll = max(began + delay, time.monotonic() + 5)
                     self.next_poll_epoch = time.time() + max(0.0, next_poll - time.monotonic())
-                    retry_at = time.monotonic() + self.cfg.notify_retry_seconds if self.pending else None
+                    if self.pending:
+                        retry_backoff = min(3600.0, self.cfg.notify_retry_seconds * (2 ** min(retry_failures, 6)))
+                        retry_at = time.monotonic() + retry_backoff
+                    else:
+                        retry_at = None
+                        retry_failures = 0
                 elif self.pending:
+                    retry_backoff = min(3600.0, self.cfg.notify_retry_seconds * (2 ** min(retry_failures, 6)))
                     if retry_at is None:
-                        retry_at = now + self.cfg.notify_retry_seconds
+                        retry_at = now + retry_backoff
                     elif now >= retry_at:
                         self.deliver()
                         self.write_status()
-                        retry_at = time.monotonic() + self.cfg.notify_retry_seconds if self.pending else None
+                        if self.pending:
+                            retry_failures += 1
+                            retry_backoff = min(3600.0, self.cfg.notify_retry_seconds * (2 ** min(retry_failures, 6)))
+                            retry_at = time.monotonic() + retry_backoff
+                        else:
+                            retry_failures = 0
+                            retry_at = None
                 wait = next_poll - time.monotonic()
                 if self.pending and retry_at is not None:
                     wait = min(wait, retry_at - time.monotonic())

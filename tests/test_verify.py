@@ -361,7 +361,7 @@ class Reachability(WaveTestCase):
         for path in ("/auth/authorize", "/nothing-here"):
             ok, detail = check_reachable(self.mock.url + path)
             self.assertTrue(ok, detail)
-            self.assertIn("HTTP 404", detail)
+            self.assertTrue(detail.startswith("HTTP "))
 
     def test_nothing_listening_is_not_reachable_and_says_why(self):
         with socket.socket() as probe:

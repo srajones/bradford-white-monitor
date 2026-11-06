@@ -8,7 +8,13 @@ set -u
 
 # find the real folder even when reached through a symbolic link
 _self=$0
+_hops=0
 while [ -h "$_self" ]; do
+  _hops=$((_hops + 1))
+  if [ "$_hops" -gt 50 ]; then
+    printf 'setup-rclone.sh: circular symbolic link detected on %s\n' "$0" >&2
+    exit 1
+  fi
   _dir=$(cd "$(dirname "$_self")" && pwd -P)
   _link=$(readlink "$_self")
   case $_link in
@@ -75,24 +81,14 @@ else
   say "rclone is a secure, open-source command line program used to sync"
   say "files to cloud storage providers like Dropbox."
   blank
-  if ask_yes_no "Would you like to install rclone now using the official installer?"; then
-    say "Running: curl https://rclone.org/install.sh | sudo bash"
-    if command -v sudo >/dev/null 2>&1; then
-      curl -s https://rclone.org/install.sh | sudo bash
-    else
-      curl -s https://rclone.org/install.sh | bash
-    fi
-    if command -v rclone >/dev/null 2>&1; then
-      ok "rclone was installed successfully!"
-    else
-      fail "Could not install rclone automatically. Please install it manually:"
-      say "  curl https://rclone.org/install.sh | sudo bash"
-      exit 1
-    fi
-  else
-    say "Skipping rclone installation. You can install it later and re-run this script."
-    exit 0
-  fi
+  say "Please install rclone using your system package manager:"
+  say "  Debian/Ubuntu:  sudo apt install rclone"
+  say "  Fedora/RHEL:    sudo dnf install rclone"
+  say "  Arch Linux:     sudo pacman -S rclone"
+  say "  macOS:          brew install rclone"
+  blank
+  say "After installing rclone, re-run this script."
+  exit 0
 fi
 blank
 
@@ -184,9 +180,9 @@ blank
 # Step 5: Optional automated daily cron job
 # -----------------------------------------------------------------------------
 printf '%sStep 5: Automated daily sync (Optional cron job)...%s\n' "$C_BOLD" "$C_OFF"
-CRON_CMD="$DIR/bwctl sync >/dev/null 2>&1"
+CRON_CMD="\"$DIR/bwctl\" sync >/dev/null 2>&1"
 
-if crontab -l 2>/dev/null | grep -Fq "$DIR/bwctl sync"; then
+if crontab -l 2>/dev/null | grep -Fq "$DIR/bwctl\" sync" || crontab -l 2>/dev/null | grep -Fq "$DIR/bwctl sync"; then
   ok "A daily cron job for bwctl sync is already scheduled in crontab."
 else
   say "Would you like to schedule an automatic daily sync (every morning at 6:00 AM)?"

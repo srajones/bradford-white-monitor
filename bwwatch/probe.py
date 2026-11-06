@@ -50,6 +50,11 @@ def run_probe(
             str(it.get("serialNumber") or ""),
         )
     ]
+    if api.cfg.selected_appliances and not matching:
+        raise WaveError(
+            "none of the %d appliance(s) on this account match BW_APPLIANCES (%s)"
+            % (len(items), ", ".join(api.cfg.selected_appliances))
+        )
     chosen = matching[0] if matching else items[0]
     ctx = {"mac": str(chosen.get("macAddress") or chosen.get("mac_address") or chosen.get("mac") or ""), "serial": "", "name": ""}
 
@@ -57,7 +62,10 @@ def run_probe(
         spec = RequestSpec.parse("GET /wave/%s?username={account_id}&macAddress={mac}" % name, label="probe")
         return api.raw(spec, ctx)
 
-    baseline = _signature(ask(PROBE_CONTROL))
+    control_resp = ask(PROBE_CONTROL)
+    if control_resp.status == 429:
+        raise TransientError("the server asked us to slow down (HTTP 429), so the search was stopped", retry_after=3600.0)
+    baseline = _signature(control_resp)
     say("An endpoint that does not exist answers:  HTTP %d  %s" % baseline)
     found: List[str] = []
     for name in PROBE_NAMES:

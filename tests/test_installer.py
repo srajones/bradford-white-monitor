@@ -72,7 +72,7 @@ class Sandbox:
 
     def __init__(self, test: unittest.TestCase, name: str = "bwheater"):
         self.test = test
-        self.base = Path(tempfile.mkdtemp(prefix="bwbox."))
+        self.base = Path(tempfile.mkdtemp(prefix="bwbox.")).resolve()
         test.addCleanup(shutil.rmtree, str(self.base), True)
         self.world = self.base / "world"
         self.home = self.base / "home"
@@ -88,6 +88,7 @@ class Sandbox:
         wrapper = self.bin / "docker"
         wrapper.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE))
         wrapper.chmod(0o755)
+        self.shim("id", '[ "$1" = "-u" ] && [ -f "$FAKE_DOCKER_WORLD/uid" ] && { cat "$FAKE_DOCKER_WORLD/uid"; exit 0; }\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec %s "$@"\n' % (shutil.which("id") or "/usr/bin/id"))
         self.baseline = self.listing()
         self.scenario()
 

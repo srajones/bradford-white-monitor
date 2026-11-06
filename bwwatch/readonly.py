@@ -29,6 +29,7 @@ request the Wave app itself makes when it merely *shows* notifications.
 """
 from __future__ import annotations
 
+import json
 import re
 import urllib.parse
 from typing import Any, FrozenSet, List
@@ -73,7 +74,19 @@ WRITE_PARAM_NAMES: FrozenSet[str] = frozenset(
     }
 )
 
+SAFE_PREFIX_WORDS: FrozenSet[str] = frozenset({"setpoint", "setpoints", "cleared", "setting", "settings"})
+
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+
+
+def _fully_unquote(s: str) -> str:
+    """Iteratively unquote percent-encoded characters until fixed point."""
+    for _ in range(10):
+        unquoted = urllib.parse.unquote(s)
+        if unquoted == s:
+            break
+        s = unquoted
+    return s
 
 
 def _words(segment: str) -> List[str]:
@@ -84,30 +97,71 @@ def _words(segment: str) -> List[str]:
     return out
 
 
+def _collect_keys(obj: Any) -> List[str]:
+    """Recursively collect and normalize all dictionary keys across nested dicts and lists."""
+    keys: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            keys.append(norm_key(_fully_unquote(str(k))))
+            keys.extend(_collect_keys(v))
+    elif isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            keys.extend(_collect_keys(item))
+    return keys
+
+
 def check_read_only(method: str, target: str, body: Any = None) -> None:
     """Raise :class:`ReadOnlyViolation` unless the request is clearly a read."""
     verb = str(method).upper()
     if verb not in ("GET", "POST"):
         raise ReadOnlyViolation("%s requests are never sent (bwwatch only reads)" % verb)
+    if "\r" in target or "\n" in target:
+        raise ReadOnlyViolation("control characters such as CR/LF are not allowed in target URL")
     parts = urllib.parse.urlsplit(target)
     if parts.scheme and parts.scheme.lower() not in ("http", "https"):
         raise ReadOnlyViolation("only http(s) addresses are allowed")
-    if "{" in parts.path or "}" in parts.path:
+
+    unquoted_path = _fully_unquote(parts.path)
+    if (
+        "{" in parts.path
+        or "}" in parts.path
+        or "{" in unquoted_path
+        or "}" in unquoted_path
+    ):
         raise ReadOnlyViolation(
             "placeholders such as {mac} are only allowed in the query string or JSON body, never in the path"
         )
-    segments = [urllib.parse.unquote(s) for s in parts.path.split("/") if s]
+    if "\\" in target or "\\" in unquoted_path:
+        raise ReadOnlyViolation("backslashes are not allowed in the path")
+
+    segments = [s for s in unquoted_path.split("/") if s]
     if not segments:
         raise ReadOnlyViolation("the request has no endpoint path")
+
     for segment in segments:
-        if segment in (".", ".."):
+        if segment in (".", "..") or ".." in segment:
             raise ReadOnlyViolation("'.' and '..' are not allowed in the path")
+        norm_seg = norm_key(segment)
+        if norm_seg in KNOWN_WRITE_ENDPOINTS or any(kw in norm_seg for kw in KNOWN_WRITE_ENDPOINTS):
+            raise ReadOnlyViolation("'%s' changes the water heater's settings and is never called" % segment)
         for word in _words(segment):
             if word in MUTATING_WORDS:
                 raise ReadOnlyViolation(
                     "'%s' contains the action word '%s'. bwwatch never changes anything on the water heater "
                     "and has no setting that allows it - change settings in the Wave app" % (segment, word)
                 )
+            if word not in SAFE_PREFIX_WORDS:
+                if any(word.startswith(m) for m in MUTATING_WORDS):
+                    raise ReadOnlyViolation(
+                        "'%s' contains the action word '%s'. bwwatch never changes anything on the water heater "
+                        "and has no setting that allows it - change settings in the Wave app" % (segment, word)
+                    )
+                if any(m in word for m in MUTATING_WORDS if len(m) >= 5):
+                    raise ReadOnlyViolation(
+                        "'%s' contains the action word '%s'. bwwatch never changes anything on the water heater "
+                        "and has no setting that allows it - change settings in the Wave app" % (segment, word)
+                    )
+
     name = segments[-1]
     if norm_key(name) in KNOWN_WRITE_ENDPOINTS:
         raise ReadOnlyViolation("'%s' changes the water heater's settings and is never called" % name)
@@ -121,9 +175,31 @@ def check_read_only(method: str, target: str, body: Any = None) -> None:
         )
     if verb == "POST" and not verb_first:
         raise ReadOnlyViolation("POST is only accepted for get.../list.../fetch... style endpoints, not '%s'" % name)
-    names = [norm_key(k) for k, _ in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
-    if isinstance(body, dict):
-        names += [norm_key(k) for k in body]
+
+    names: List[str] = []
+    for q_str in (parts.query, _fully_unquote(parts.query)):
+        if not q_str:
+            continue
+        norm_q = q_str.replace(";", "&").replace("\r", "&").replace("\n", "&")
+        for k, v in urllib.parse.parse_qsl(norm_q, keep_blank_values=True):
+            for item in (k, _fully_unquote(k), v, _fully_unquote(v)):
+                item_str = str(item)
+                names.append(norm_key(item_str))
+                for sub in re.split(r"[;&\r\n]+", item_str):
+                    if "=" in sub:
+                        names.append(norm_key(sub.split("=", 1)[0]))
+                    else:
+                        names.append(norm_key(sub))
+    if body is not None:
+        if isinstance(body, (str, bytes)):
+            try:
+                parsed_body = json.loads(body)
+                names += _collect_keys(parsed_body)
+            except Exception:
+                pass
+        else:
+            names += _collect_keys(body)
+
     bad = sorted(set(n for n in names if n in WRITE_PARAM_NAMES))
     if bad:
         raise ReadOnlyViolation(

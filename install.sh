@@ -22,8 +22,24 @@
 set -u
 umask 077
 
-case $0 in
-  */*) SELF_DIR=${0%/*} ;;
+# find the real folder even when reached through a symbolic link
+_self=$0
+_hops=0
+while [ -h "$_self" ]; do
+  _hops=$((_hops + 1))
+  if [ "$_hops" -gt 50 ]; then
+    printf 'install.sh: circular symbolic link detected on %s\n' "$0" >&2
+    exit 1
+  fi
+  _dir=$(cd "$(dirname "$_self")" && pwd -P)
+  _link=$(readlink "$_self")
+  case $_link in
+    /*) _self=$_link ;;
+    *)  _self=$_dir/$_link ;;
+  esac
+done
+case $_self in
+  */*) SELF_DIR=${_self%/*} ;;
   *)   SELF_DIR=. ;;
 esac
 DIR=$(cd "$SELF_DIR" 2>/dev/null && pwd -P) || { printf 'install.sh: cannot find the folder it is in\n' >&2; exit 1; }

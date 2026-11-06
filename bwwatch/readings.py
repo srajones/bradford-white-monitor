@@ -7,6 +7,7 @@ number that does appear is recorded as a bonus, but none is required.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -44,8 +45,11 @@ def _as_int(value: Any) -> Optional[int]:
     if isinstance(value, bool) or value in (None, ""):
         return None
     try:
-        return int(float(value))
-    except (TypeError, ValueError):
+        f = float(value)
+        if not math.isfinite(f):
+            return None
+        return int(f)
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -53,8 +57,11 @@ def _as_float(value: Any) -> Optional[float]:
     if isinstance(value, bool) or value in (None, ""):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        f = float(value)
+        if not math.isfinite(f):
+            return None
+        return f
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

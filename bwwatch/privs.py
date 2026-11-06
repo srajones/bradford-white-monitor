@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import IO
+from typing import IO, Optional
 
 from .errors import ConfigError
 
@@ -25,28 +25,34 @@ class AlreadyRunning(Exception):
     """Another bwwatch already holds the lock on this data directory."""
 
 
-def _fix_owner(path: Path, uid: int, gid: int) -> None:
+def _fix_owner_and_mode(path: Path, uid: int, gid: int, mode: Optional[int] = None) -> None:
     try:
         info = os.lstat(str(path))
-        if (info.st_uid, info.st_gid) != (uid, gid):
+        if uid is not None and gid is not None and (info.st_uid, info.st_gid) != (uid, gid):
             os.lchown(str(path), uid, gid)
+        if mode is not None and not path.is_symlink():
+            current_mode = info.st_mode & 0o777
+            if current_mode != mode:
+                os.chmod(str(path), mode)
     except FileNotFoundError:
         pass
-    except PermissionError as exc:
-        log.warning("could not change the owner of %s: %s", path, exc)
+    except (PermissionError, OSError) as exc:
+        log.warning("could not change owner/mode of %s: %s", path, exc)
 
 
 def _hand_over(data_dir: Path, uid: int, gid: int) -> None:
-    _fix_owner(data_dir, uid, gid)
+    _fix_owner_and_mode(data_dir, uid, gid, mode=0o700)
     for name in _KNOWN_FILES:
-        _fix_owner(data_dir / name, uid, gid)
+        _fix_owner_and_mode(data_dir / name, uid, gid, mode=0o600)
     for sub in ("backups", "corrupt", "logs", "exports"):
         root = data_dir / sub
         if root.is_dir() and not root.is_symlink():
-            _fix_owner(root, uid, gid)
+            _fix_owner_and_mode(root, uid, gid, mode=0o700)
             for dirpath, dirnames, filenames in os.walk(str(root)):  # does not follow symlinks
-                for entry in dirnames + filenames:
-                    _fix_owner(Path(dirpath) / entry, uid, gid)
+                for d in dirnames:
+                    _fix_owner_and_mode(Path(dirpath) / d, uid, gid, mode=0o700)
+                for f in filenames:
+                    _fix_owner_and_mode(Path(dirpath) / f, uid, gid, mode=0o600)
 
 
 def prepare_runtime(data_dir: Path, uid: int = APP_UID, gid: int = APP_GID) -> None:
@@ -57,6 +63,7 @@ def prepare_runtime(data_dir: Path, uid: int = APP_UID, gid: int = APP_GID) -> N
     created bind mount "just works" while the service itself never runs with privileges.
     Started as any other user it only checks the directory is writable.
     """
+    os.umask(0o077)  # database, tokens and backups are private to the app user
     if os.geteuid() == 0:
         data_dir.mkdir(parents=True, exist_ok=True)
         _hand_over(data_dir, uid, gid)
@@ -65,7 +72,6 @@ def prepare_runtime(data_dir: Path, uid: int = APP_UID, gid: int = APP_GID) -> N
         os.setuid(uid)
         if os.geteuid() == 0:  # pragma: no cover - paranoia
             raise RuntimeError("failed to drop root privileges")
-    os.umask(0o077)  # database, tokens and backups are private to the app user
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=str(data_dir)):

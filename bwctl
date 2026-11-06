@@ -21,10 +21,17 @@
 # Like install.sh it works only inside its own folder and uses nothing but Docker.
 
 set -u
+umask 077
 
 # find the real folder even when this file is reached through a symbolic link
 _self=$0
+_hops=0
 while [ -h "$_self" ]; do
+  _hops=$((_hops + 1))
+  if [ "$_hops" -gt 50 ]; then
+    printf 'bwctl: circular symbolic link detected on %s\n' "$0" >&2
+    exit 1
+  fi
   _dir=$(cd "$(dirname "$_self")" && pwd -P)
   _link=$(readlink "$_self")
   case $_link in
@@ -44,7 +51,7 @@ die() { printf 'bwctl: %s\n' "$*" >&2; exit 1; }
 running() {
   [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ] || return 1
   _owner=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$CONTAINER" 2>/dev/null)
-  [ "$_owner" = "$DIR" ] || [ "$_owner" = "$(cd "$DIR" && pwd)" ]
+  [ "$_owner" = "$DIR" ] || [ "$(cd "$_owner" 2>/dev/null && pwd -P)" = "$DIR" ]
 }
 
 usage() {
@@ -111,8 +118,15 @@ case $cmd in
       _val=$(tr -d '\r\n' < "$DIR/data/.bw_appliances.env")
       rm -f "$DIR/data/.bw_appliances.env"
       if [ -f "$DIR/.env" ]; then
+        case $_val in
+          *[\"\'\ #\\]*|"") _quoted_val="\"$(printf '%s' "$_val" | sed 's/[\\"]/\\&/g')\"" ;;
+          *) _quoted_val="$_val" ;;
+        esac
+        [ -z "$_val" ] && _quoted_val=""
+        ( umask 077 && : > "$DIR/.env.new" )
         if grep -q '^[[:space:]]*#*[[:space:]]*BW_APPLIANCES=' "$DIR/.env"; then
-          awk -v val="$_val" '
+          _BW_VAL="$_quoted_val" awk '
+            BEGIN { val = ENVIRON["_BW_VAL"] }
             /^[[:space:]]*#*[[:space:]]*BW_APPLIANCES=/ && !done {
               if (val == "") print "# BW_APPLIANCES=";
               else print "BW_APPLIANCES=" val;
@@ -121,8 +135,9 @@ case $cmd in
             { print }
           ' "$DIR/.env" > "$DIR/.env.new" && mv "$DIR/.env.new" "$DIR/.env"
         elif [ -n "$_val" ]; then
-          cp "$DIR/.env" "$DIR/.env.new" && printf '\nBW_APPLIANCES=%s\n' "$_val" >> "$DIR/.env.new" && mv "$DIR/.env.new" "$DIR/.env"
+          cp "$DIR/.env" "$DIR/.env.new" && printf '\nBW_APPLIANCES=%s\n' "$_quoted_val" >> "$DIR/.env.new" && mv "$DIR/.env.new" "$DIR/.env"
         fi
+        rm -f "$DIR/.env.new" 2>/dev/null || true
         chmod 600 "$DIR/.env" 2>/dev/null || true
       fi
       if running; then
@@ -135,7 +150,7 @@ case $cmd in
   report)
     need_ready
     mkdir -p "$DIR/data/exports"
-    chmod 777 "$DIR/data/exports" 2>/dev/null || true
+    chmod 700 "$DIR/data/exports" 2>/dev/null || true
     in_service report "$@"
     ;;
   sync)
@@ -147,7 +162,7 @@ case $cmd in
       die "Remote 'dropbox:' is not configured in rclone. To set it up, run:  $DIR/setup-rclone.sh"
     fi
     mkdir -p "$DIR/data/backups" "$DIR/data/exports"
-    chmod 777 "$DIR/data/backups" "$DIR/data/exports" 2>/dev/null || true
+    chmod 700 "$DIR/data/backups" "$DIR/data/exports" 2>/dev/null || true
     printf 'Generating fresh report & CSV exports...\n'
     in_service report
     printf 'Syncing bwwatch backups and reports to Dropbox...\n'

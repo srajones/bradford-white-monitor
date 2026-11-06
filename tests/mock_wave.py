@@ -257,6 +257,9 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/auth/token":
             mock.handle_token(self, rec)
         elif parsed.path in ("/auth/authorize", "/authorize"):
+            query = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            with mock.lock:
+                mock.last_state = query.get("state", "test")
             html = '<html><script>SETTINGS={"csrf":"mock-csrf-token-12345","transId":"mock-trans-id-67890"};</script></html>'
             self.reply(200, html, headers={"Content-Type": "text/html"})
         elif parsed.path in ("/auth/SelfAsserted", "/SelfAsserted"):
@@ -267,7 +270,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self.reply(200, {"status": "200"})
         elif parsed.path in ("/auth/api/CombinedSigninAndSignUp/confirmed", "/api/CombinedSigninAndSignUp/confirmed"):
             code = mock.issue_login_code("mock-login-code-999")
-            redir = f"{REDIRECT}?state=test&code={code}"
+            with mock.lock:
+                st = getattr(mock, "last_state", "test")
+            redir = f"{REDIRECT}?state={st}&code={code}"
             self.send_response(302)
             self.send_header("Location", redir)
             self.send_header("Content-Length", "0")

@@ -38,13 +38,23 @@ def save_selected_appliances(data_dir: Path, selected: Sequence[str], env_val: s
     atomic_write_json(Path(data_dir) / HEATERS_FILE, record, mode=0o600)
 
 
-def load_selected_appliances(data_dir: Path, env_appliances: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+def load_selected_appliances(
+    data_dir: Path,
+    env_appliances: Tuple[str, ...] = (),
+    raw_env: Optional[str] = None,
+) -> Tuple[str, ...]:
     """Return the active heater filter (empty tuple = monitor all heaters).
 
     Reads ``heaters.json`` in ``data_dir`` if present, unless ``BW_APPLIANCES`` in ``.env``
     was manually changed after ``heaters.json`` was written.
     """
     path = Path(data_dir) / HEATERS_FILE
+    if raw_env is not None and (not raw_env.strip() or raw_env.strip().lower() in ("all", "*")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return ()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, ValueError):
@@ -55,7 +65,7 @@ def load_selected_appliances(data_dir: Path, env_appliances: Tuple[str, ...] = (
     saved_env = tuple(part.strip() for part in saved_env_raw.split(",") if part.strip())
     if len(saved_env) == 1 and saved_env[0].lower() in ("all", "*"):
         saved_env = ()
-    if env_appliances != saved_env and env_appliances:
+    if env_appliances != saved_env:
         return env_appliances
     return tuple(
         s.strip()
@@ -88,7 +98,7 @@ def monitored_macs(conn: Any, cfg: "Config") -> Optional[FrozenSet[str]]:
 
 
 def load_env_file(path: Path | str = ".env") -> Dict[str, str]:
-    """Parse a simple .env file into a dict (ignoring comments and empty lines)."""
+    """Parse a simple .env file into a dict (ignoring comments, quotes, and whitespace)."""
     env: Dict[str, str] = {}
     p = Path(path)
     if not p.is_file():
@@ -97,17 +107,53 @@ def load_env_file(path: Path | str = ".env") -> Dict[str, str]:
         content = p.read_text(encoding="utf-8")
     except OSError:
         return env
-    for line in content.splitlines():
-        line = line.strip()
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        if "=" in line:
-            key, val = line.split("=", 1)
-            key = key.strip()
-            val = val.strip()
-            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                val = val[1:-1]
-            env[key] = val
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if val.startswith('"'):
+            buf = []
+            idx = 1
+            escaped = False
+            closed = False
+            while idx < len(val):
+                ch = val[idx]
+                if escaped:
+                    if ch == "n":
+                        buf.append("\n")
+                    elif ch == "r":
+                        buf.append("\r")
+                    elif ch == "t":
+                        buf.append("\t")
+                    else:
+                        buf.append(ch)
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    closed = True
+                    break
+                else:
+                    buf.append(ch)
+                idx += 1
+            if closed:
+                val = "".join(buf)
+            else:
+                val = val[1:]
+        elif val.startswith("'"):
+            closing = val.find("'", 1)
+            if closing != -1:
+                val = val[1:closing]
+            else:
+                val = val[1:]
+        else:
+            val = re.split(r"\s+#", val, maxsplit=1)[0].rstrip()
+        env[key] = val
     return env
 
 
@@ -130,7 +176,10 @@ DEFAULT_VOLATILE_KEYS = (
     "read,isRead,unread,seen,viewed,acknowledged,ack,age,ago,relativeTime,elapsed"
 )
 # Config-ish flags that merely *mention* faults/alerts (not an active fault).
-DEFAULT_SCAN_IGNORE = r"(?i)enabled|support|capab|setting|prefer|subscri|threshold|logging|configur"
+DEFAULT_SCAN_IGNORE = (
+    r"(?i)enabled|support|capab|setting|prefer|subscri|threshold|logging|configur|"
+    r"email|address|recipient|date|time|stamp"
+)
 
 
 # --- request specs ----------------------------------------------------------
@@ -233,15 +282,15 @@ MIN_POLL_SECONDS = 300
 class NtfyConfig:
     url: str
     topic: str
-    token: str = ""
+    token: str = field(default="", repr=False)
     user: str = ""
-    password: str = ""
+    password: str = field(default="", repr=False)
     events: Optional[FrozenSet[str]] = None
 
 
 @dataclass(frozen=True)
 class TelegramConfig:
-    token: str
+    token: str = field(repr=False)
     chat_id: str
     api_base: str = "https://api.telegram.org"
     events: Optional[FrozenSet[str]] = None
@@ -253,7 +302,7 @@ class SmtpConfig:
     port: int
     security: str  # starttls | ssl | none
     user: str
-    password: str
+    password: str = field(repr=False)
     sender: str
     recipients: Tuple[str, ...]
     events: Optional[FrozenSet[str]] = None
@@ -270,7 +319,7 @@ class WebhookConfig:
 class HomeAssistantConfig:
     """A Home Assistant automation webhook: POST {url} with a JSON body (see README)."""
 
-    url: str
+    url: str = field(repr=False)
     events: Optional[FrozenSet[str]] = None
 
 
@@ -300,7 +349,7 @@ class Config:
     http_timeout: float
     extra_headers: Dict[str, str]
     account_id: str
-    seed_refresh_token: str
+    seed_refresh_token: str = field(repr=False)
     allow_insecure_http: bool
     list_request: RequestSpec
     status_request: Optional[RequestSpec]
@@ -340,11 +389,12 @@ class Config:
     fault_poll_hours: int = 12
     # Optional filter of water heaters to monitor (MACs, serials, or friendly names; empty = monitor all).
     appliances: Tuple[str, ...] = ()
+    raw_appliances_env: Optional[str] = None
 
     @property
     def selected_appliances(self) -> Tuple[str, ...]:
         """Active water heater filter (combines live heaters.json selection and BW_APPLIANCES)."""
-        return load_selected_appliances(self.data_dir, self.appliances)
+        return load_selected_appliances(self.data_dir, self.appliances, self.raw_appliances_env)
 
     def matches_appliance(self, mac: str, name: str = "", serial: str = "") -> bool:
         """True if this heater is selected for monitoring (or when all heaters are monitored)."""
@@ -355,7 +405,9 @@ class Config:
         norm_candidates = {norm_key(s) for s in (mac, name, serial) if s and s.strip()}
         for token in selected:
             t = token.strip().lower()
-            if not t or t in ("all", "*"):
+            if not t:
+                continue
+            if t in ("all", "*"):
                 return True
             if t in candidates:
                 return True
@@ -501,7 +553,8 @@ def _build(env: Mapping[str, str]) -> Config:
             raise ConfigError("BW_EXTRA_HEADERS must be a JSON object like {\"X-Header\": \"value\"} (%s)" % exc)
         if not isinstance(parsed, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()):
             raise ConfigError("BW_EXTRA_HEADERS must be a JSON object of string keys and string values")
-        extra_headers = dict(parsed)
+        forbidden = {"host", "authorization", "connection", "transfer-encoding", "content-length"}
+        extra_headers = {k: v for k, v in parsed.items() if k.lower() not in forbidden}
 
     list_request = RequestSpec.parse(_get(env, "BW_LIST_REQUEST", DEFAULT_LIST_REQUEST), label="BW_LIST_REQUEST")
     # Unset -> default request; set but empty -> status polling disabled.
@@ -655,4 +708,5 @@ def _build(env: Mapping[str, str]) -> Config:
         fault_poll_interval=_int(env, "BW_FAULT_POLL_INTERVAL_SECONDS", 600, MIN_POLL_SECONDS, 86400),
         fault_poll_hours=_int(env, "BW_FAULT_POLL_HOURS", 12, 1, 24 * 14),
         appliances=appliances,
+        raw_appliances_env=env.get("BW_APPLIANCES"),
     )

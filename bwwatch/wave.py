@@ -13,11 +13,15 @@ which found that scripted password login does not work):
 from __future__ import annotations
 
 import base64
+import contextlib
 import email.utils
+import fcntl
 import http.client
 import http.cookiejar
 import json
 import logging
+import os
+import random
 import re
 import socket
 import ssl
@@ -133,7 +137,7 @@ def retry_after_seconds(resp: "HttpResponse", default: float = 3600.0) -> float:
                 seconds = max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
             except (TypeError, ValueError):
                 seconds = default
-    return max(60.0, min(seconds, 6 * 3600.0))
+    return max(1.0, min(seconds, 6 * 3600.0))
 
 
 # --- a record of every request (for the request log) -------------------------
@@ -212,6 +216,35 @@ class TokenStore:
         record.update({k: v for k, v in extra.items() if v is not None})
         atomic_write_json(self.path, record, mode=0o600)
 
+    @contextlib.contextmanager
+    def lock(self, timeout: float = 30.0):
+        """Cross-process advisory lock on token.json to prevent token rotation race conditions."""
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        start = time.monotonic()
+        locked = False
+        try:
+            while not locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except (BlockingIOError, OSError):
+                    if time.monotonic() - start > timeout:
+                        raise TransientError("timeout waiting for token lock %s" % lock_path)
+                    time.sleep(0.1)
+            yield
+        finally:
+            if locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
 
 def _oauth_error(resp: HttpResponse) -> str:
     """Short, secret-free description of an OAuth error response."""
@@ -275,6 +308,7 @@ class TokenManager:
         self.refresh_expires_at: Optional[str] = None
         self.retry_after = 0.0  # seconds the sign-in server last asked us to wait (0 = no request)
         self.calls: List[CallRecord] = []  # sign-in requests of the current poll (the service stores and clears them)
+        self._last_refresh_token: Optional[str] = None
 
     def _headers(self) -> Dict[str, str]:
         return {"User-Agent": self.cfg.user_agent, "Accept": "application/json"}
@@ -366,8 +400,9 @@ class TokenManager:
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
+        opener_cred = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), _NoRedirect())
         try:
-            resp2 = opener.open(req2, timeout=self.cfg.http_timeout)
+            resp2 = opener_cred.open(req2, timeout=self.cfg.http_timeout)
             raw2 = resp2.read().decode("utf-8", "replace")
             res2 = json.loads(raw2)
         except Exception as exc:
@@ -397,41 +432,56 @@ class TokenManager:
         if not redirect_loc:
             raise AuthError("sign-in succeeded but no redirect location was returned by Azure AD B2C")
 
-        code, _ = parse_redirect(redirect_loc)
-        self.exchange_code(code)
+        code, params = parse_redirect(redirect_loc)
+        if params.get("state") and params["state"] != state:
+            raise AuthError("OAuth state parameter mismatch in redirect")
+        self.exchange_code(code, expected_nonce=nonce)
         log.info("completed automated headless sign-in for %s (account %s)", scrub(user, 50), self.account_id)
         return self.store.load() or {}
 
     def _post_token(self, form: Mapping[str, str], what: str) -> Dict[str, Any]:
-        started = time.monotonic()
-        try:
-            resp = http_request("POST", self.cfg.token_url, headers=self._headers(), form=form, timeout=self.cfg.http_timeout)
-        except WaveError as exc:
-            note_call(self.calls, "token", "POST", self.cfg.token_url, None, started, exc)
-            raise
-        note_call(self.calls, "token", "POST", self.cfg.token_url, resp, started)
-        if resp.status == 200:
-            data = resp.json()
-            if not isinstance(data, dict):
-                raise ApiError("%s: unexpected token response" % what)
-            return data
-        detail = _oauth_error(resp)
-        if resp.status == 429:
-            wait = retry_after_seconds(resp)
-            self.retry_after = max(self.retry_after, wait)
-            raise TransientError("%s was rate limited (HTTP 429); asked to wait %d s" % (what, wait), retry_after=wait)
-        if resp.status in (400, 401, 403):
-            raise AuthError("%s was rejected (HTTP %d): %s" % (what, resp.status, detail))
-        if resp.status in (408, 425) or resp.status >= 500:
-            raise TransientError("%s failed (HTTP %d): %s" % (what, resp.status, detail))
-        raise ApiError("%s failed (HTTP %d): %s" % (what, resp.status, detail))
+        retries = 2
+        for attempt in range(retries + 1):
+            started = time.monotonic()
+            try:
+                resp = http_request("POST", self.cfg.token_url, headers=self._headers(), form=form, timeout=self.cfg.http_timeout)
+            except WaveError as exc:
+                note_call(self.calls, "token", "POST", self.cfg.token_url, None, started, exc)
+                if attempt < retries and isinstance(exc, TransientError):
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise
+            note_call(self.calls, "token", "POST", self.cfg.token_url, resp, started)
+            if resp.status == 200:
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise ApiError("%s: unexpected token response" % what)
+                return data
+            detail = _oauth_error(resp)
+            if resp.status == 429:
+                wait = retry_after_seconds(resp)
+                self.retry_after = max(self.retry_after, wait)
+                raise TransientError("%s was rate limited (HTTP 429); asked to wait %d s" % (what, wait), retry_after=wait)
+            if resp.status in (400, 401, 403):
+                raise AuthError("%s was rejected (HTTP %d): %s" % (what, resp.status, detail))
+            if resp.status in (408, 425) or resp.status >= 500:
+                if attempt < retries:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise TransientError("%s failed (HTTP %d): %s" % (what, resp.status, detail))
+            raise ApiError("%s failed (HTTP %d): %s" % (what, resp.status, detail))
+        raise ApiError("%s: retry attempts exhausted" % what)
 
-    def _adopt(self, tokens: Mapping[str, Any]) -> None:
+    def _adopt(self, tokens: Mapping[str, Any], expected_nonce: Optional[str] = None) -> None:
         # The API accepts the id_token when no access_token is issued (as the app's own client does).
         bearer = tokens.get("access_token") or tokens.get("id_token")
         if not bearer:
             raise ApiError("the token response had neither an access_token nor an id_token")
         claims = jwt_claims(str(bearer))
+        if expected_nonce:
+            nonce_in_claims = claims.get("nonce")
+            if nonce_in_claims and nonce_in_claims != expected_nonce:
+                raise AuthError("ID token nonce mismatch in response")
         now = self._clock()
         expires = claims.get("exp")
         if not isinstance(expires, (int, float)):
@@ -446,7 +496,7 @@ class TokenManager:
         if not self.cfg.account_id:
             self.account_id = claims.get("oid") or claims.get("sub") or self.account_id
 
-    def exchange_code(self, code: str) -> None:
+    def exchange_code(self, code: str, expected_nonce: Optional[str] = None) -> None:
         """Turn the one-time login code into a saved refresh token."""
         tokens = self._post_token(
             {
@@ -461,45 +511,96 @@ class TokenManager:
         refresh = tokens.get("refresh_token")
         if not refresh:
             raise AuthError("sign-in worked but no refresh token came back (is 'offline_access' in BW_SCOPE?)")
-        self._adopt(tokens)
-        self.store.save(str(refresh), source="login", refresh_expires_in=tokens.get("refresh_token_expires_in"))
+        self._adopt(tokens, expected_nonce=expected_nonce)
+        self._last_refresh_token = str(refresh)
+        self.store.save(
+            str(refresh),
+            source="login",
+            refresh_expires_in=tokens.get("refresh_token_expires_in"),
+            access_token=self._bearer,
+            expires_at=self._expires_at,
+            account_id=self.account_id,
+        )
 
-    def refresh(self) -> None:
-        refresh_token = self._current_refresh_token()
-        if not refresh_token:
-            raise AuthError("not signed in yet. Run: docker compose run --rm bwwatch login")
-        try:
-            tokens = self._post_token(
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": self.cfg.client_id,
-                    "refresh_token": refresh_token,
-                    "scope": self.cfg.scope,
-                },
-                "token refresh",
+    def refresh(self, force: bool = False) -> None:
+        with self.store.lock():
+            saved = self.store.load()
+            now = self._clock()
+            if not force and saved and saved.get("access_token") and saved.get("expires_at"):
+                try:
+                    exp = float(saved["expires_at"])
+                    if exp - self._margin > now:
+                        self._bearer = str(saved["access_token"])
+                        self._expires_at = exp
+                        if saved.get("refresh_token"):
+                            self._last_refresh_token = str(saved["refresh_token"])
+                        if not self.account_id and saved.get("account_id"):
+                            self.account_id = str(saved["account_id"])
+                        return
+                except (ValueError, TypeError):
+                    pass
+
+            refresh_token = (saved and str(saved.get("refresh_token"))) or self._current_refresh_token()
+            if not refresh_token:
+                raise AuthError("not signed in yet. Run: docker compose run --rm bwwatch login")
+            try:
+                tokens = self._post_token(
+                    {
+                        "grant_type": "refresh_token",
+                        "client_id": self.cfg.client_id,
+                        "refresh_token": refresh_token,
+                        "scope": self.cfg.scope,
+                    },
+                    "token refresh",
+                )
+            except AuthError as exc:
+                if self.cfg.username and self.cfg.password:
+                    log.info("saved refresh token was rejected (%s); attempting automated re-login with credentials from .env", exc)
+                    self.login_with_credentials()
+                    return
+                raise
+            rotated = tokens.get("refresh_token")
+            if rotated and rotated != refresh_token:
+                # Save BEFORE using anything from this response: the old token may now be dead.
+                self.store.save(str(rotated), source="refresh", refresh_expires_in=tokens.get("refresh_token_expires_in"))
+            self._adopt(tokens)
+            self._last_refresh_token = str(rotated or refresh_token)
+            self.store.save(
+                str(rotated or refresh_token),
+                source="refresh",
+                refresh_expires_in=tokens.get("refresh_token_expires_in"),
+                access_token=self._bearer,
+                expires_at=self._expires_at,
+                account_id=self.account_id,
             )
-        except AuthError as exc:
-            if self.cfg.username and self.cfg.password:
-                log.info("saved refresh token was rejected (%s); attempting automated re-login with credentials from .env", exc)
-                self.login_with_credentials()
-                return
-            raise
-        rotated = tokens.get("refresh_token")
-        if rotated and rotated != refresh_token:
-            # Save BEFORE using anything from this response: the old token may now be dead.
-            self.store.save(str(rotated), source="refresh", refresh_expires_in=tokens.get("refresh_token_expires_in"))
-        self._adopt(tokens)
 
     def bearer(self, force: bool = False) -> str:
-        if not force and self._bearer and self._clock() < self._expires_at - self._margin:
+        now = self._clock()
+        if not force and self._bearer and now < self._expires_at - self._margin:
             return self._bearer
-        self.refresh()
+        if not force:
+            saved = self.store.load()
+            if saved and saved.get("access_token") and saved.get("expires_at"):
+                if float(saved["expires_at"]) - self._margin > now:
+                    self._bearer = str(saved["access_token"])
+                    self._expires_at = float(saved["expires_at"])
+                    self._last_refresh_token = str(saved.get("refresh_token"))
+                    if not self.account_id and saved.get("account_id"):
+                        self.account_id = str(saved["account_id"])
+                    return self._bearer
+        self.refresh(force=force)
         assert self._bearer is not None
         return self._bearer
 
     def invalidate(self) -> None:
         self._bearer = None
         self._expires_at = 0.0
+        saved = self.store.load()
+        if saved and "access_token" in saved:
+            saved.pop("access_token", None)
+            saved.pop("expires_at", None)
+            self.store.save(saved.get("refresh_token", ""), **{k: v for k, v in saved.items() if k != "refresh_token"})
+
 
 
 # --- API calls --------------------------------------------------------------
@@ -557,12 +658,15 @@ class WaveApi:
             except TransientError as exc:
                 if exc.retry_after is not None or attempt >= len(self.retry_delays):
                     raise  # a rate limit is never retried inside the same poll
-                log.warning("%s - retrying in %.0fs", exc, self.retry_delays[attempt])
-                if self.stop.wait(self.retry_delays[attempt]):
+                base_delay = self.retry_delays[attempt]
+                delay = base_delay * random.uniform(0.8, 1.2)
+                log.warning("%s - retrying in %.1fs", exc, delay)
+                if self.stop.wait(delay):
                     raise
 
     def _exchange(self, method: str, url: str, body: Any) -> HttpResponse:
         """The single place a request is sent to the Wave API (callers have run check_read_only)."""
+        check_read_only(method, url, body)
         if method not in ("GET", "POST"):  # belt and braces
             raise ApiError("refusing to send a %s request" % method)
         resp: Optional[HttpResponse] = None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 import ssl
 from dataclasses import dataclass
@@ -172,9 +173,14 @@ class Notifier:
         cfg = self.cfg.webhook
         assert cfg is not None
         if cfg.format == "slack":
-            payload: Dict[str, Any] = {"text": truncate("*%s*\n%s" % (msg.title, msg.body), 3500)}
+            def slack_escape(text: str) -> str:
+                return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            payload: Dict[str, Any] = {"text": truncate("*%s*\n%s" % (slack_escape(msg.title), slack_escape(msg.body)), 3500)}
         elif cfg.format == "discord":
-            payload = {"content": truncate("**%s**\n%s" % (msg.title, msg.body), 1900)}
+            payload = {
+                "content": truncate("**%s**\n%s" % (msg.title, msg.body), 1900),
+                "allowed_mentions": {"parse": []},
+            }
         else:
             payload = structured(msg)
             payload["text"] = truncate("%s\n%s" % (msg.title, msg.body), 3500)
@@ -185,7 +191,8 @@ class Notifier:
         cfg = self.cfg.smtp
         assert cfg is not None
         mail = EmailMessage()
-        mail["Subject"] = "[bwwatch] " + truncate(msg.title, 150)
+        clean_title = re.sub(r"[\r\n]+", " ", msg.title).strip()
+        mail["Subject"] = "[bwwatch] " + truncate(clean_title, 150)
         mail["From"] = cfg.sender
         mail["To"] = ", ".join(cfg.recipients)
         mail["X-Priority"] = {5: "1", 4: "2", 3: "3", 2: "4", 1: "5"}.get(msg.priority, "3")

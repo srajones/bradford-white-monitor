@@ -18,7 +18,7 @@ from . import observe
 from .config import Config, RequestSpec
 from .db import meta_get, meta_set, savepoint, tx
 from .errors import AuthError, WaveError
-from .faults import CODE_KEYS, FaultEvent, digest, extract_events, find_active_lists, normalize_event, scan_state
+from .faults import CODE_KEYS, FaultEvent, _first, _flatten, digest, extract_events, find_active_lists, normalize_event, scan_state
 from .notify import Message, Notifier
 from .readings import extract_reading, reading_changes, reading_from_row
 from .util import hours_since, iso, local_time, parse_iso, scrub, truncate
@@ -141,7 +141,7 @@ def fetch(
             raise
         except WaveError as exc:
             result.errors.append("fault request: %s" % scrub(exc, 300))
-    if fault_spec is not None and not fault_spec.per_appliance:
+    if fault_spec is not None and not fault_spec.per_appliance and prepared:
         ok, payload = _try(result.errors, "fault request", lambda: api.call(fault_spec))
         result.account_faults, result.account_faults_fetched = payload, ok
     for data in prepared:
@@ -497,6 +497,9 @@ def _apply_state_change(
     if row["state"] == "cleared":
         return NewFault(row["id"], mac, name, "event", ev.code or row["code"], ev.description or row["description"],
                         ev.occurred_at or row["occurred_at"], state="active", again=True)
+    elif row["state"] in (None, "unknown"):
+        return NewFault(row["id"], mac, name, "event", ev.code or row["code"], ev.description or row["description"],
+                        ev.occurred_at or row["occurred_at"], state="active", again=False)
     return None
 
 
@@ -538,6 +541,30 @@ def _record_fault_payload(
     first = meta_get(conn, baseline_key) is None
     events, where = extract_events(payload, cfg.fault_options)
     created: List[NewFault] = []
+    if mac == ACCOUNT and cfg.selected_appliances and events is not None:
+        filtered_events = []
+        for ev in events:
+            try:
+                item_data = json.loads(ev.raw) if isinstance(ev.raw, str) else ev.raw
+            except Exception:
+                item_data = None
+            if isinstance(item_data, dict):
+                flat_ev = _flatten(item_data)
+                device_keys = (
+                    "deviceid", "applianceid", "heaterid",
+                    "serialnumber", "serial", "applianceserial",
+                    "macaddress", "mac", "appliancemac",
+                    "name", "appliancename", "appliance_name",
+                )
+                extracted_ids = [
+                    str(flat_ev[k]).strip()
+                    for k in device_keys
+                    if flat_ev.get(k) is not None and str(flat_ev[k]).strip()
+                ]
+                if extracted_ids and not any(cfg.matches_appliance(ident) for ident in extracted_ids):
+                    continue
+            filtered_events.append(ev)
+        events = filtered_events
     if events is None:
         fingerprint = "blob:" + digest(payload, cfg.fault_options.volatile)[:32]
         row = conn.execute(
@@ -831,11 +858,12 @@ def apply_cycle(conn: sqlite3.Connection, cfg: Config, fetched: FetchResult, *, 
             found = _section(conn, errors, "reading the account-level fault history",
                              lambda: _record_fault_payload(conn, cfg, ACCOUNT, "your Wave account", fetched.account_faults, now, outcome, note))
             new_faults.extend(found or [])
+        faults_fetched_by_mac = {app.mac: app.faults_fetched for app in fetched.appliances}
         for mac, lines in notes.items():
             if not lines:
                 continue
             body = "bwwatch is now monitoring %s.\n%s" % (names.get(mac, mac), "\n".join(lines))
-            if cfg.fault_request is None and not a.faults_fetched and mac != ACCOUNT:
+            if cfg.fault_request is None and not faults_fetched_by_mac.get(mac, False) and mac != ACCOUNT:
                 body += (
                     "\nNote: BW_FAULT_REQUEST is not set, so the fault/notification history is NOT being read yet. "
                     "bwwatch tries GET /wave/getApplianceErrors on its own (./bwctl discover)."
@@ -930,10 +958,21 @@ def deliver_outbox(conn: sqlite3.Connection, notifier: Notifier, cfg: Config, *,
             else:
                 log.info("alert %d delivered via %s: %s", row["id"], ", ".join(results), row["title"])
         else:
-            conn.execute(
-                "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?",
-                ("; ".join("%s: %s" % kv for kv in failures.items()), row["id"]),
-            )
-            log.warning("alert %d could not be delivered (will retry): %s", row["id"], failures)
-            break  # the rest would fail the same way; try again on the retry timer
+            attempts = (row["attempts"] or 0) + 1
+            err_msg = "; ".join("%s: %s" % kv for kv in failures.items())
+            is_permanent = any(code in err_msg for code in ("HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404")) or attempts >= 5
+            if is_permanent:
+                conn.execute(
+                    "UPDATE outbox SET status = 'dropped', attempts = ?, last_error = ? WHERE id = ?",
+                    (attempts, err_msg, row["id"]),
+                )
+                log.warning("alert %d permanently failed (%d attempts, dropped): %s", row["id"], attempts, failures)
+                continue
+            else:
+                conn.execute(
+                    "UPDATE outbox SET attempts = ?, last_error = ? WHERE id = ?",
+                    (attempts, err_msg, row["id"]),
+                )
+                log.warning("alert %d could not be delivered (will retry): %s", row["id"], failures)
+                continue
     return int(conn.execute("SELECT COUNT(*) FROM outbox WHERE status = 'pending'").fetchone()[0])
