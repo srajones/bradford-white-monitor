@@ -27,7 +27,7 @@ run_cmd() {
     9)  "$BWCTL" test-notify --event fault ;;
     10) "$BWCTL" logs -f ;;
     11) "$BWCTL" restart ;;
-    12) "$BWCTL" update ;;
+    12) "$DIR/bwupdate" ;;
     13) "$DIR/setup-rclone.sh" ;;
     14) "$BWCTL" heaters ;;
     0|q|Q|exit) exit 0 ;;

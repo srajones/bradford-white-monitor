@@ -160,7 +160,7 @@ You can run commands directly without the menu by passing arguments to `./bwctl`
 | `test-notify` `[--event fault]` | Send a real test notification to phone / Home Assistant |
 | `logs` `[-f]` | View real-time service output (`-f` follows live) |
 | `restart` | Restart container and re-read updated `.env` configuration |
-| `update` | Rebuild image after a `git pull` and verify health |
+| `update` | Fetch the latest git branch, pull newest commits, rebuild image, and verify (`./bwupdate`) |
 | `verify` `[--wait N]` | Run end-to-end self-test (checks cloud, database, alerts, backups) |
 | `login` | Re-authenticate with Wave (automatic via `.env` or browser link) |
 | `check` | Dry-run check: reads cloud status and displays what bwwatch understands |

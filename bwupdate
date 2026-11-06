@@ -1,0 +1,48 @@
+#!/bin/sh
+# bwupdate: Automatically find the latest branch (most recent commits), pull, rebuild, and restart bwwatch.
+# Usage:
+#   ./bwupdate            # auto-detects the branch with the newest commits on origin and updates
+#   ./bwupdate <branch>   # updates to a specific branch on origin
+
+set -u
+
+_self=$0
+while [ -h "$_self" ]; do
+  _dir=$(cd "$(dirname "$_self")" && pwd -P)
+  _link=$(readlink "$_self")
+  case $_link in
+    /*) _self=$_link ;;
+    *)  _self=$_dir/$_link ;;
+  esac
+done
+DIR=$(cd "$(dirname "$_self")" 2>/dev/null && pwd -P) || { printf 'bwupdate: cannot find its own folder\n' >&2; exit 1; }
+cd "$DIR" || exit 1
+
+if [ -d "$DIR/.git" ] && command -v git >/dev/null 2>&1; then
+  printf 'Fetching latest branches and commits from origin...\n'
+  if git fetch origin --prune; then
+    if [ $# -gt 0 ] && [ -n "${1:-}" ]; then
+      _target_branch=$1
+      _latest_ref="origin/$_target_branch"
+    else
+      # Primary sort: newest commit date (-committerdate); tie-breaker: highest version name (-version:refname)
+      _latest_ref=$(git for-each-ref --sort=-version:refname --sort=-committerdate --format='%(refname:short)' refs/remotes/origin/ 2>/dev/null | grep -v '^origin/HEAD$' | head -n 1)
+      _target_branch=${_latest_ref#origin/}
+    fi
+    if [ -n "$_target_branch" ] && [ -n "$_latest_ref" ]; then
+      _commit_info=$(git log -n 1 --format='%h (%cr) - %s' "$_latest_ref" 2>/dev/null || true)
+      printf 'Latest branch: %s -> %s\n' "$_target_branch" "$_commit_info"
+      _cur_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+      if [ "$_cur_branch" != "$_target_branch" ]; then
+        printf 'Switching from %s to %s...\n' "${_cur_branch:-detached}" "$_target_branch"
+        git checkout -B "$_target_branch" "$_latest_ref" || git checkout "$_target_branch"
+      fi
+      git merge --ff-only "$_latest_ref" || git reset --hard "$_latest_ref"
+      chmod +x "$DIR/bwctl" "$DIR/bwcheat" "$DIR/bwupdate" "$DIR/install.sh" "$DIR/setup-rclone.sh" 2>/dev/null || true
+    fi
+  else
+    printf 'Warning: git fetch failed; rebuilding with current local files...\n' >&2
+  fi
+fi
+
+exec "$DIR/bwctl" update --no-git

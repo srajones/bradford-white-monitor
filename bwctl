@@ -95,6 +95,10 @@ case $cmd in
   logs)           need_ready; dc logs --tail 200 "$@" bwwatch ;;
   update)
     need_ready
+    if [ "${1:-}" != "--no-git" ] && [ -d "$DIR/.git" ] && command -v git >/dev/null 2>&1 && [ -x "$DIR/bwupdate" ]; then
+      exec "$DIR/bwupdate" "$@"
+    fi
+    [ "${1:-}" = "--no-git" ] && shift
     printf 'Rebuilding the image from the files in %s ...\n' "$DIR"
     dc build && dc up -d bwwatch && printf 'Done. Checking:\n' && dc exec -T bwwatch bwwatch verify --wait 60
     ;;

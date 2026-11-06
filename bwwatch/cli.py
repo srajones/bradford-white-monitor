@@ -649,6 +649,11 @@ def _collect_known_heaters(cfg: Config) -> list[dict[str, str]]:
     """Gather all water heaters from the Wave cloud (if signed in) and the local database."""
     by_mac: dict[str, dict[str, str]] = {}
     _store, tokens, api = _make_api(cfg)
+    if not tokens.has_credentials() and cfg.username and cfg.password:
+        try:
+            tokens.login_with_credentials()
+        except WaveError:
+            pass
     if tokens.has_credentials():
         try:
             for item in api.list_appliances():
